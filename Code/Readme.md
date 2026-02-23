@@ -1,6 +1,7 @@
 Scripts Description
 
-#(Examining_Features_for_Partitioning_Strategies.Rmd)  
+(Examining_Features_for_Partitioning_Strategies.Rmd)  
+
 Examines the cross-sectional distribution of California green bond yields to identify and validate the structural features used to partition bonds for curve estimation. Produces 3D scatter plots of yields colour-coded by callability, coupon range, and tax status across the term structure, and documents the partition boundaries used in the bootstrapping application. Confirms that the three selected features generate distinct and well-separated yield clusters, while comparable separation is not observed for other bond characteristics such as credit rating, issuer sector, or use of proceeds.
 
 
