@@ -1,0 +1,4638 @@
+---
+title: "Ladder with 10ys Duration"
+output: html_document
+author: "Hadi"
+---
+
+```{r}
+
+library(arules)
+library(arulesViz)
+library(knitr)
+library(dplyr)
+library(RColorBrewer)
+library(stringr)
+library(quantmod)
+library(splines2)
+library(splines)
+library(mgcv)
+library(RQuantLib)
+library(tidyr)
+library(xts)
+library(plotly)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(scatterplot3d)
+library(tidyverse)
+library(zoo)
+library(writexl)
+library(YieldCurve)
+library(patchwork)
+library(gridExtra)
+library(stargazer)
+library(scales)
+library(pdfetch)
+library(xtable)
+```
+
+Load data sets
+```{r}
+
+California <- readRDS(need("/path/to/data" ))
+MLFeat <- read_xlsx(need("/path/to/data" ))
+ARL_S2 <- readRDS(need("/path/to/data" ))
+
+par_data <- read_csv(need("daily_par_yield-curve-rates-1990-2024.csv"),
+                       na = c("NA","#N/A N/A","#N/A Field Not Applicable","#N/A Invalid Security"))
+
+names(par_data)[-1] <- c("0.083", "0.167", "0.231", "0.333", "0.500", "1", "2", "3",
+"5", "7", "10", "20", "30")
+
+par_data$Date <- as.Date(par_data$Date)
+
+par_data_mat <- as.matrix(par_data)
+par_data_mat <- par_data_mat[, -1]
+
+par_tby <- as.xts(par_data_mat, order.by = par_data$Date)
+
+par_tby <- na.approx(par_tby, na.rm = FALSE)
+
+
+```
+
+
+Bootstrapping Par yields
+```{r}
+
+
+# --- BOOTSTRAP ZERO RATES FROM PAR YIELDS ---
+
+# Helper function: Get zero rate at specific time (with interpolation)
+get_zero_for_time <- function(zero_rates, maturities, target_time, max_idx) {
+  if (max_idx < 1) return(NA_real_)
+  
+  # Only use already-calculated rates
+  avail_zeros <- zero_rates[1:max_idx]
+  avail_mats <- maturities[1:max_idx]
+  
+  # Remove NAs
+  valid <- !is.na(avail_zeros)
+  if (!any(valid)) return(NA_real_)
+  
+  avail_zeros <- avail_zeros[valid]
+  avail_mats <- avail_mats[valid]
+  
+  # Exact match
+  exact <- which(abs(avail_mats - target_time) < 0.01)
+  if (length(exact) > 0) return(avail_zeros[exact[1]])
+  
+  # Before first point
+  if (target_time < min(avail_mats)) return(avail_zeros[1])
+  
+  # After last point
+  if (target_time > max(avail_mats)) return(avail_zeros[length(avail_zeros)])
+  
+  # Linear interpolation
+  lower <- max(which(avail_mats <= target_time))
+  upper <- min(which(avail_mats >= target_time))
+  
+  t1 <- avail_mats[lower]
+  t2 <- avail_mats[upper]
+  z1 <- avail_zeros[lower]
+  z2 <- avail_zeros[upper]
+  
+  weight <- (target_time - t1) / (t2 - t1)
+  return(z1 + weight * (z2 - z1))
+}
+
+# Main bootstrap function
+bootstrap_zero_correct <- function(yields, maturities) {
+  n <- length(maturities)
+  zero_rates <- rep(NA_real_, n)
+  
+  for (i in seq_len(n)) {
+    if (is.na(yields[i])) next
+    
+    t <- maturities[i]
+    par <- yields[i]
+    
+    # Keep short maturities (≤ 0.5 years) as par - these are T-Bills (zero coupon)
+    if (i == 1 || t <= 0.5) {
+      zero_rates[i] <- par
+      next
+    }
+    
+    # Check if we have any previous zero rates
+    if (all(is.na(zero_rates[1:(i-1)]))) {
+      zero_rates[i] <- par
+      next
+    }
+    
+    # For longer maturities (> 0.5 years), do full bootstrap
+    coupon <- par / 2
+    n_periods <- round(t * 2)
+    
+    # Discount ALL coupon payments (except the final one with principal)
+    pv_coupons <- 0
+    for (period in 1:(n_periods - 1)) {
+      coupon_time <- period / 2
+      z_rate <- get_zero_for_time(zero_rates, maturities, coupon_time, i - 1)
+      
+      if (!is.na(z_rate)) {
+        pv_coupons <- pv_coupons + coupon / (1 + z_rate/200)^period
+      }
+    }
+    
+    # Solve for zero rate: 100 = pv_coupons + (100 + coupon) / (1 + z/2)^n
+    final_payment <- 100 + coupon
+    pv_final <- 100 - pv_coupons
+    
+    if (pv_final > 0) {
+      z_semi <- (final_payment / pv_final)^(1/n_periods) - 1
+      zero_rates[i] <- z_semi * 2 * 100
+    } else {
+      zero_rates[i] <- par  # Fallback
+    }
+  }
+  
+  return(zero_rates)
+}
+
+# --- MAIN CODE---
+
+# Get all maturity columns (INCLUDING 0.333)
+maturity_cols <- setdiff(names(par_data), "Date")
+maturities <- as.numeric(maturity_cols)
+
+# Sort by maturity
+sorted_idx <- order(maturities)
+maturities <- maturities[sorted_idx]
+maturity_cols <- maturity_cols[sorted_idx]
+
+# Prepare output dataframe
+zero_data <- par_data[, c("Date", maturity_cols)]
+zero_data[, maturity_cols] <- NA_real_
+
+# Apply bootstrap for each date (row)
+for (row in seq_len(nrow(par_data))) {
+  yields <- as.numeric(par_data[row, maturity_cols])
+  if (all(is.na(yields))) next
+  
+  zero_row <- bootstrap_zero_correct(yields, maturities)
+  zero_data[row, maturity_cols] <- as.list(zero_row)
+}
+
+
+
+
+names(zero_data)[-1] <- c("0.083", "0.167", "0.231", "0.333", "0.500", "1", "2", "3",
+"5", "7", "10", "20", "30")
+
+zero_data$Date <- as.Date(zero_data$Date)
+
+zero_data_mat <- as.matrix(zero_data)
+zero_data_mat <- zero_data_mat[, -1]
+
+zero_tby <- as.xts(zero_data_mat, order.by = zero_data$Date)
+
+zero_tby <- na.approx(zero_tby, na.rm = FALSE)
+
+
+```
+
+
+
+Data preprocessing and Macaulay duration calculation
+```{r}
+
+#Preparing the dataset
+California <- California %>%
+  left_join(ARL_S2 %>% 
+              distinct(ID_CUSIP, .keep_all = TRUE) %>%
+              dplyr::select(ID_CUSIP, Iss_pri._spread, S_AT_Iss, DAM, DM, Y_OID,
+                     log_AMT_ISSUED, Amt_iss_int, log_MUNI_ISSUE_SIZE, 
+                     MUNI_ISSUE_SIZE_int, Log_DEBT, Log_Sale_Turn, 
+                     MTY_YEARS_int, Y_l_day, Active_years, years_to_maturity, 
+                     Active_years_int, years_to_maturity_int), 
+            by = "ID_CUSIP")
+
+
+
+
+
+
+# --- Function to calculate Macaulay Duration (using YF = years to maturity) ---
+calc_macaulay_duration <- function(ytm, price, coupon_rate, freq, face = 100, years_to_maturity) {
+  if (is.na(ytm) || is.na(price) || is.na(coupon_rate) || is.na(freq) ||
+      is.na(years_to_maturity) || price <= 0 || years_to_maturity <= 0) return(NA)
+  
+  y <- ytm / 100 / freq                    # Yield per period
+  c <- face * coupon_rate / 100 / freq     # Coupon payment per period
+  n <- round(years_to_maturity * freq)     # Total number of payments
+  
+  t <- 1:n
+  CF <- rep(c, n)
+  CF[n] <- CF[n] + face                    # Add face value at maturity
+  
+  PV_CF <- CF / (1 + y)^t
+  duration <- sum(t * PV_CF) / (freq * price)
+  
+  return(duration)
+}
+
+# --- Apply to California dataset ---
+California <- California %>%
+  rowwise() %>%
+  mutate(
+    duration_mac = calc_macaulay_duration(
+      ytm = yield,
+      price = GPV_2,
+      coupon_rate = CPN,
+      freq = CPN_FREQ,
+      years_to_maturity = YF
+    )
+  ) %>%
+  ungroup()
+
+```
+
+# ============================================================================
+# GREEN BONDS PORTFOLIO WITH DYNAMIC DURATION-BASED TENOR SELECTION
+# ============================================================================
+
+```{r}
+
+# ============================================================================
+# SECTION 1: CREATE 9 CURVE-FITTING GROUPS 
+# ============================================================================
+
+# Callable and Non-callable Bond datasets
+Cal_callable <- California %>% filter(CALLABLE == "TRUE", CPN != 15, CPN_FREQ != 12)
+Cal_non_callable <- California %>% filter(CALLABLE == "FALSE", CPN != 15, CPN_FREQ != 12)
+
+# Coupon intervals
+interval_non_call <- cut(Cal_non_callable$CPN, breaks = c(0, 2.99, 4.999, 7.69), 
+                         labels = c("CPN_0_3", "CPN_3_5", "CPN_5_8"))
+Cal_non_callable <- Cal_non_callable %>% mutate(CPN_Group = interval_non_call)
+
+interval_call <- cut(Cal_callable$CPN, breaks = c(0, 3.5, 4.999, 8.5), 
+                     labels = c("CPN_0_3.5", "CPN_3.5_5", "CPN_5_8.5"))
+Cal_callable <- Cal_callable %>% mutate(CPN_Group = interval_call)
+
+# Tax provinces to EXCLUDE in the "op" groups
+excluded_tax <- c(
+  "FED TAXABLE/ST TAX-EXEMPT",
+  "FED TAXABLE",
+  "FED TAXABLE/ST TAXABLE"
+)
+
+# --------- NON-CALLABLE ---------
+G1_nc_all <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3",
+    Date >= as.Date("2020-01-01")
+  )
+
+G2_nc_op <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_3_5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)    
+  )
+
+G2_nc_ft <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_3_5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+G3_nc_all <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_5_8",
+    Date >= as.Date("2020-01-01")
+  )
+
+# --------- CALLABLE ---------
+G1_c_op <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3.5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)     
+  )
+
+G1_c_ft <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3.5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+G2_c_op <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_3.5_5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)     
+  )
+
+G2_c_ft <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_3.5_5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+G3_c_all <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_5_8.5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)    
+  )
+
+cat("\n=== Curve-Fitting Groups Created ===\n")
+cat("G1_nc_all:", nrow(G1_nc_all), "bonds\n")
+cat("G2_nc_op:", nrow(G2_nc_op), "bonds\n")
+cat("G2_nc_ft:", nrow(G2_nc_ft), "bonds\n")
+cat("G3_nc_all:", nrow(G3_nc_all), "bonds\n")
+cat("G1_c_op:", nrow(G1_c_op), "bonds\n")
+cat("G1_c_ft:", nrow(G1_c_ft), "bonds\n")
+cat("G2_c_op:", nrow(G2_c_op), "bonds\n")
+cat("G2_c_ft:", nrow(G2_c_ft), "bonds\n")
+cat("G3_c_all:", nrow(G3_c_all), "bonds\n")
+
+
+# ============================================================================
+# HELPER FUNCTION: Identify which curve-fitting group a bond belongs to
+# ============================================================================
+
+identify_bond_group <- function(callable, cpn, tax_prov) {
+  
+  # Determine if callable
+  is_callable <- (callable == "TRUE" | callable == TRUE | callable == "Callable")
+  
+  # Determine coupon group
+  if (is_callable) {
+    if (cpn <= 3.5) {
+      cpn_group <- "CPN_0_3.5"
+    } else if (cpn <= 5) {
+      cpn_group <- "CPN_3.5_5"
+    } else {
+      cpn_group <- "CPN_5_8.5"
+    }
+  } else {
+    if (cpn <= 3) {
+      cpn_group <- "CPN_0_3"
+    } else if (cpn <= 5) {
+      cpn_group <- "CPN_3_5"
+    } else {
+      cpn_group <- "CPN_5_8"
+    }
+  }
+  
+  # Determine tax province group
+  is_excluded_tax <- !is.na(tax_prov) && tax_prov %in% excluded_tax
+  is_fed_taxable_st_exempt <- !is.na(tax_prov) && tax_prov == "FED TAXABLE/ST TAX-EXEMPT"
+  
+  # Match to specific group
+  if (!is_callable) {
+    # Non-callable
+    if (cpn_group == "CPN_0_3") {
+      return("G1_nc_all")
+    } else if (cpn_group == "CPN_3_5") {
+      if (is_fed_taxable_st_exempt) {
+        return("G2_nc_ft")
+      } else {
+        return("G2_nc_op")
+      }
+    } else if (cpn_group == "CPN_5_8") {
+      return("G3_nc_all")
+    }
+  } else {
+    # Callable
+    if (cpn_group == "CPN_0_3.5") {
+      if (is_fed_taxable_st_exempt) {
+        return("G1_c_ft")
+      } else {
+        return("G1_c_op")
+      }
+    } else if (cpn_group == "CPN_3.5_5") {
+      if (is_fed_taxable_st_exempt) {
+        return("G2_c_ft")
+      } else {
+        return("G2_c_op")
+      }
+    } else if (cpn_group == "CPN_5_8.5") {
+      return("G3_c_all")
+    }
+  }
+  
+  return(NA)  # If no match found
+}
+
+# ============================================================================
+# HELPER FUNCTION: Get the actual dataset for a group name 
+# ============================================================================
+
+get_group_data <- function(group_name) {
+  switch(group_name,
+         "G1_nc_all" = G1_nc_all,
+         "G2_nc_op" = G2_nc_op,
+         "G2_nc_ft" = G2_nc_ft,
+         "G3_nc_all" = G3_nc_all,
+         "G1_c_op" = G1_c_op,
+         "G1_c_ft" = G1_c_ft,
+         "G2_c_op" = G2_c_op,
+         "G2_c_ft" = G2_c_ft,
+         "G3_c_all" = G3_c_all,
+         NULL)
+}
+
+# ============================================================================
+# HELPER FUNCTIONS FOR ZERO-COUPON RATE CONVERSION 
+# ============================================================================
+
+# Function for calculating bond prices using fitted yields
+bp_calculator_a2 <- function(x, y, m, cuts, bond_type, year_fraction, coupon_rate, 
+                          coupon_frequency, face_value) {
+  
+  bond_price <- 0
+  fitted_curve <- suppressWarnings(lm(y ~ bs(x, degree = m, knots = cuts)))
+  
+  if (bond_type %in% c("FIXED", "FIXED, OID")) {
+    C <- face_value * coupon_rate / coupon_frequency
+    n <- year_fraction * coupon_frequency
+    tau_n <- c(seq(ifelse(n %% 1 == 0.00, 1, n %% 1), n, by = 1) / coupon_frequency)
+    
+    for (t in tau_n) {
+      discounted_cashflow <- 
+        C / ((1 + predict(fitted_curve, newdata = data.frame(x = t))/(100*coupon_frequency)) ^ which(tau_n == t))
+      bond_price <- bond_price + discounted_cashflow 
+    }
+    
+    final_cashflow <- 
+      (face_value) / ((1 + predict(fitted_curve, newdata = data.frame(x = year_fraction))/(100*coupon_frequency)) ^ which(tau_n == year_fraction))
+    bond_price <- bond_price + final_cashflow  
+  } else if (bond_type == "ZERO COUPON") {
+    bond_price <- 
+      (face_value) / ((1 + predict(fitted_curve, newdata = data.frame(x = year_fraction))/(100*coupon_frequency)) ^ which(tau_n == year_fraction))
+  } else {
+    stop("Unsupported bond type")
+  }
+  
+  return(bond_price)
+}
+
+# Function for calculating equivalent ZCB YTM (EQ.10)
+zcb_eq_YTM_2 <- function(zcb_ytm, year_fraction,
+                           face_value, bond_type, bond_price, 
+                          coupon, coupon_frequency) {
+  C <- face_value * coupon / coupon_frequency
+  n <- year_fraction * coupon_frequency
+  tau_n <- c(seq(ifelse(n %% 1 == 0.00, 1, n %% 1), n, by = 1) / coupon_frequency)
+  if (bond_type %in% c("FIXED", "FIXED, OID", "ZERO COUPON, OID")) {
+    return(((1 + zcb_ytm) ^ which(tau_n == year_fraction)) - ((face_value + C) / bond_price))
+  } else {
+    stop("Unsupported bond_type")
+  }
+}
+
+# ============================================================================
+# HELPER FUNCTION: Extract ZERO-COUPON yield using appropriate group 
+# ============================================================================
+
+extract_zcb_yield_safe <- function(current_date, target_tenor, 
+                                    bond_callable, bond_cpn, bond_tax_prov,
+                                    min_yield = -5, max_yield = 15,
+                                    outlier_threshold = 1000,
+                                    coupon_frequency = 2, face_value = 100) {
+  
+  # Identify which group this bond belongs to
+  group_name <- identify_bond_group(bond_callable, bond_cpn, bond_tax_prov)
+  
+  if (is.na(group_name)) {
+    return(list(zcb_yield = NA, flag = "NO_GROUP_MATCH", n_bonds = 0, group = NA))
+  }
+  
+  # Get the appropriate group data
+  group_data <- get_group_data(group_name)
+  
+  if (is.null(group_data) || nrow(group_data) == 0) {
+    return(list(zcb_yield = NA, flag = "EMPTY_GROUP", n_bonds = 0, group = group_name))
+  }
+  
+  # Get bonds available on this date from the group
+  bonds_today <- group_data %>%
+    filter(Date == current_date)
+  
+  # CHECK 1: Need at least 5 bonds for reliable curve fitting
+  if (nrow(bonds_today) < 5) {
+    return(list(zcb_yield = NA, flag = "INSUFFICIENT_DATA", n_bonds = nrow(bonds_today), group = group_name))
+  }
+  
+  # CHECK 2: Is target tenor within data range?
+  tenor_range <- range(bonds_today$YF, na.rm = TRUE)
+  
+  if (target_tenor < tenor_range[1] || target_tenor > tenor_range[2]) {
+    closest_tenor <- ifelse(target_tenor < tenor_range[1], 
+                            tenor_range[1], 
+                            tenor_range[2])
+    flag <- paste0("EXTRAPOLATION_AVOIDED: Used tenor ", round(closest_tenor, 2), 
+                   " instead of ", round(target_tenor, 2))
+    target_tenor <- closest_tenor
+  } else {
+    flag <- "OK"
+  }
+  
+  # Fit curve
+  tryCatch({
+    x <- bonds_today$YF
+    y <- bonds_today$yield
+    
+    # CHECK 3: Remove outlier yields before fitting
+    y_median <- median(y, na.rm = TRUE)
+    y_mad <- mad(y, na.rm = TRUE)
+    outliers <- abs(y - y_median) > outlier_threshold * y_mad
+    
+    if (sum(outliers) > 0) {
+      x <- x[!outliers]
+      y <- y[!outliers]
+      flag <- paste0(flag, " | OUTLIERS_REMOVED:", sum(outliers))
+    }
+    
+    # Recheck after outlier removal
+    if (length(x) < 3) {
+      return(list(zcb_yield = NA, flag = "INSUFFICIENT_DATA_AFTER_CLEANING", 
+                  n_bonds = length(x), group = group_name))
+    }
+    
+    # Fit the curve
+    m <- 1
+    cuts <- summary(sort(x))[c(2, 3, 5)]
+    
+    # STEP 1: Calculate bond price using fitted coupon bond yields
+    typical_coupon <- median(y, na.rm = TRUE) / 100
+    
+    bond_price <- bp_calculator_a2(
+      x = x, 
+      y = y, 
+      m = m, 
+      cuts = cuts,
+      bond_type = "FIXED",
+      year_fraction = target_tenor,
+      coupon_rate = typical_coupon,
+      coupon_frequency = coupon_frequency,
+      face_value = face_value
+    )
+    
+    # STEP 2: Convert to equivalent zero-coupon yield
+    zcb_yield_result <- tryCatch({
+      uniroot(
+        f = zcb_eq_YTM_2,
+        interval = c(-0.10, 0.30),
+        year_fraction = target_tenor,
+        face_value = face_value,
+        bond_type = "FIXED",
+        bond_price = bond_price,
+        coupon = typical_coupon,
+        coupon_frequency = coupon_frequency
+      )$root
+    }, error = function(e) {
+      return((face_value / bond_price)^(1/(target_tenor * coupon_frequency)) - 1)
+    })
+    
+    # Convert to percentage
+    zcb_yield_pct <- zcb_yield_result * 100
+    
+    # CHECK 4: Bound yields to reasonable range
+    original_yield <- zcb_yield_pct
+    zcb_yield_pct <- pmax(min_yield, pmin(max_yield, zcb_yield_pct))
+    
+    if (abs(original_yield - zcb_yield_pct) > 0.01) {
+      flag <- paste0(flag, " | YIELD_CAPPED: ", round(original_yield, 2), 
+                     "% -> ", round(zcb_yield_pct, 2), "%")
+    }
+    
+    return(list(
+      zcb_yield = zcb_yield_pct,
+      flag = flag,
+      n_bonds = length(x),
+      group = group_name
+    ))
+    
+  }, error = function(e) {
+    return(list(zcb_yield = NA, flag = paste("ERROR:", e$message), 
+                n_bonds = nrow(bonds_today), group = group_name))
+  })
+}
+
+# ============================================================================
+# HELPER FUNCTION: Find nearest trading date 
+# ============================================================================
+
+find_nearest_trading_date <- function(target_date, available_dates) {
+  date_diffs <- abs(as.numeric(available_dates - target_date))
+  nearest_idx <- which.min(date_diffs)
+  return(available_dates[nearest_idx])
+}
+
+# ============================================================================
+# HELPER FUNCTION: Calculate Macaulay Duration for a bond
+# ============================================================================
+
+calculate_bond_duration <- function(ytm, coupon_rate, years_to_maturity, 
+                                    coupon_frequency = 2, face_value = 100) {
+  
+  # Calculate number of periods
+  n_periods <- years_to_maturity * coupon_frequency
+  
+  # Coupon payment per period
+  C <- (coupon_rate / 100) * face_value / coupon_frequency
+  
+  # Discount rate per period
+  r <- (ytm / 100) / coupon_frequency
+  
+  # Calculate weighted present value of cash flows
+  weighted_pv <- 0
+  total_pv <- 0
+  
+  for (t in 1:n_periods) {
+    time_years <- t / coupon_frequency
+    pv_cashflow <- C / (1 + r)^t
+    weighted_pv <- weighted_pv + (time_years * pv_cashflow)
+    total_pv <- total_pv + pv_cashflow
+  }
+  
+  # Add final payment (principal)
+  pv_principal <- face_value / (1 + r)^n_periods
+  weighted_pv <- weighted_pv + (years_to_maturity * pv_principal)
+  total_pv <- total_pv + pv_principal
+  
+  # Macaulay duration
+  duration <- weighted_pv / total_pv
+  
+  return(duration)
+}
+
+# ============================================================================
+# HELPER FUNCTION: Find bond with target duration (WITH TENOR CONSTRAINTS)
+# ============================================================================
+
+find_bond_with_target_duration <- function(purchase_data, 
+                                           current_date, 
+                                           target_duration,
+                                           synthetic_callable,
+                                           synthetic_coupon,
+                                           synthetic_tax_prov,
+                                           duration_tolerance = 2.0,
+                                           min_tenor = 5.0,
+                                           max_tenor = 20.0) {
+  
+  # Get bonds available on this date that match synthetic bond characteristics
+  available_bonds <- purchase_data %>%
+    filter(Date == current_date,
+           CALLABLE == synthetic_callable,
+           MUNI_TAX_PROV == synthetic_tax_prov,
+           !is.na(duration_mac),
+           !is.na(YF),
+           !is.na(yield))
+  
+  if (nrow(available_bonds) == 0) {
+    return(list(
+      tenor = NA,
+      duration = NA,
+      yield = NA,
+      n_candidates = 0,
+      status = "NO_BONDS_AVAILABLE"
+    ))
+  }
+  
+  n_total_candidates <- nrow(available_bonds)
+  
+  # APPLY TENOR CONSTRAINTS: Filter out bonds with tenor < min_tenor or > max_tenor
+  available_bonds <- available_bonds %>%
+    filter(YF >= min_tenor, YF <= max_tenor)
+  
+  n_after_tenor_filter <- nrow(available_bonds)
+  
+  if (nrow(available_bonds) == 0) {
+    return(list(
+      tenor = NA,
+      duration = NA,
+      yield = NA,
+      n_candidates = n_total_candidates,
+      n_after_tenor_filter = 0,
+      status = "NO_BONDS_IN_TENOR_RANGE",
+      message = paste0("All ", n_total_candidates, " candidates outside tenor range [", 
+                      min_tenor, ", ", max_tenor, "]")
+    ))
+  }
+  
+  # Calculate distance from target duration
+  available_bonds <- available_bonds %>%
+    mutate(duration_diff = abs(duration_mac - target_duration))
+  
+  # Find bonds with closest duration
+  min_diff <- min(available_bonds$duration_diff, na.rm = TRUE)
+  
+  # Check if the closest match is within tolerance
+  if (min_diff > duration_tolerance) {
+    return(list(
+      tenor = NA,
+      duration = NA,
+      yield = NA,
+      n_candidates = n_total_candidates,
+      n_after_tenor_filter = n_after_tenor_filter,
+      status = "NO_GOOD_MATCH",
+      min_diff = min_diff,
+      message = paste0(n_after_tenor_filter, " bonds in tenor range, but closest duration diff = ", 
+                      round(min_diff, 2), " > tolerance ", duration_tolerance)
+    ))
+  }
+  
+  closest_bonds <- available_bonds %>%
+    filter(duration_diff == min_diff)
+  
+  # If multiple bonds with same duration, pick the one with higher yield
+  if (nrow(closest_bonds) > 1) {
+    selected_bond <- closest_bonds %>%
+      arrange(desc(yield)) %>%
+      slice(1)
+  } else {
+    selected_bond <- closest_bonds
+  }
+  
+  return(list(
+    tenor = selected_bond$YF[1],
+    duration = selected_bond$duration_mac[1],
+    yield = selected_bond$yield[1],
+    n_candidates = n_total_candidates,
+    n_after_tenor_filter = n_after_tenor_filter,
+    status = "GOOD_MATCH",
+    cusip = selected_bond$ID_CUSIP[1],
+    message = paste0("Found match from ", n_after_tenor_filter, " bonds in tenor range [", 
+                    min_tenor, ", ", max_tenor, "]")
+  ))
+}
+
+# ============================================================================
+# HELPER FUNCTION: Calculate portfolio duration
+# ============================================================================
+
+calculate_portfolio_duration <- function(bond_positions, 
+                                        current_date,
+                                        current_index,
+                                        bond_values,
+                                        new_bond_value = 0,
+                                        new_bond_duration = 0) {
+  
+  if (length(bond_positions) == 0 && new_bond_value == 0) {
+    return(0)
+  }
+  
+  total_value <- sum(bond_values, na.rm = TRUE) + new_bond_value
+  
+  if (total_value == 0) {
+    return(0)
+  }
+  
+  weighted_duration <- 0
+  
+  # Existing bonds
+  for (j in 1:length(bond_positions)) {
+    bond <- bond_positions[[j]]
+    
+    if (bond$purchase_date > current_date) {
+      next
+    }
+    
+    # Calculate remaining tenor
+    days_held <- as.numeric(current_date - bond$purchase_date)
+    years_held <- days_held / 365
+    remaining_tenor <- bond$purchase_tenor - years_held
+    
+    if (remaining_tenor > 0 && !is.na(bond_values[j]) && bond_values[j] > 0) {
+      
+      # Calculate duration for this bond
+      bond_duration <- calculate_bond_duration(
+        ytm = bond$purchase_zcb_yield,
+        coupon_rate = bond$cpn,
+        years_to_maturity = remaining_tenor,
+        coupon_frequency = 2,
+        face_value = 100
+      )
+      
+      weight <- bond_values[j] / total_value
+      weighted_duration <- weighted_duration + (weight * bond_duration)
+    }
+  }
+  
+  # New bond
+  if (new_bond_value > 0) {
+    weight <- new_bond_value / total_value
+    weighted_duration <- weighted_duration + (weight * new_bond_duration)
+  }
+  
+  return(weighted_duration)
+}
+
+# ============================================================================
+# HELPER FUNCTION: Calculate required duration for new bond
+# ============================================================================
+
+calculate_required_duration <- function(current_portfolio_duration,
+                                       current_portfolio_value,
+                                       new_bond_value,
+                                       target_portfolio_duration) {
+  
+  total_value <- current_portfolio_value + new_bond_value
+  
+  if (total_value == 0) {
+    return(target_portfolio_duration)
+  }
+  
+  # Weighted average formula:
+  # target_duration = (current_duration * current_value + new_duration * new_value) / total_value
+  # Solve for new_duration:
+  
+  required_duration <- (target_portfolio_duration * total_value - 
+                       current_portfolio_duration * current_portfolio_value) / new_bond_value
+  
+  return(required_duration)
+}
+
+# ============================================================================
+# HELPER FUNCTION: Convert duration to approximate tenor
+# ============================================================================
+
+duration_to_tenor <- function(target_duration, coupon_rate = 2.5, ytm = 2.5) {
+  
+  approx_tenor <- target_duration * (1 + ytm/200)
+  return(approx_tenor)
+}
+
+# ============================================================================
+# MAIN FUNCTION: Portfolio Construction with Dynamic Duration-Based Tenor Selection
+# FINAL REVISION: Added tenor constraints (5-20 years)
+# ============================================================================
+
+construct_portfolio_zcb_synthetic_duration <- function(purchase_data,  
+                                                       par_data,
+                                                       w0 = 1000000,           
+                                                       alpha = 0.10,           
+                                                       start_date = "2020-01-01",
+                                                       end_date = "2024-12-31",
+                                                       r_f_annual = 0.01,
+                                                       target_portfolio_duration = 10.0,
+                                                       min_target_duration = 9.0,
+                                                       max_target_duration = 11.0,
+                                                       min_price = 20,
+                                                       max_price = 150,
+                                                       max_daily_price_change = 0.10,
+                                                       max_daily_portfolio_change = 0.20,
+                                                       coupon_frequency = 2,
+                                                       face_value = 100,
+                                                       duration_match_tolerance = 2.0,
+                                                       min_tenor = 5.0,
+                                                       max_tenor = 20.0) {
+  
+  # Calculate median coupon from purchase_data to determine synthetic bond coupon
+  median_coupon <- median(purchase_data$CPN, na.rm = TRUE)
+  synthetic_coupon <- round(median_coupon * 2) / 2  # Round to nearest 0.5
+  
+  # Synthetic bond characteristics (fixed for all purchases)
+  synthetic_callable <- "FALSE"
+  
+  # Determine most prevalent tax province in purchase_data based on unique CUSIPs
+  tax_prov_counts <- purchase_data %>%
+    group_by(MUNI_TAX_PROV) %>%
+    summarise(n_cusips = n_distinct(ID_CUSIP), .groups = 'drop') %>%
+    arrange(desc(n_cusips))
+  
+  synthetic_tax_prov <- tax_prov_counts$MUNI_TAX_PROV[1]
+  
+  cat("\n=== Tax Province Selection ===\n")
+  cat("Tax province counts in purchase_data:\n")
+  print(tax_prov_counts)
+  cat("\nSelected tax province:", synthetic_tax_prov, 
+      "(", tax_prov_counts$n_cusips[1], "unique CUSIPs )\n")
+  
+  # Determine which group this synthetic bond belongs to
+  synthetic_group <- identify_bond_group(
+    callable = synthetic_callable,
+    cpn = synthetic_coupon,
+    tax_prov = synthetic_tax_prov
+  )
+  
+  cat("\n=== Synthetic Bond Configuration ===\n")
+  cat("Target Portfolio Duration:", target_portfolio_duration, "years\n")
+  cat("Duration Range:", min_target_duration, "-", max_target_duration, "years\n")
+  cat("Coupon:", synthetic_coupon, "% (median from purchase_data:", round(median_coupon, 2), "%)\n")
+  cat("Callable:", synthetic_callable, "\n")
+  cat("Tax Status:", synthetic_tax_prov, "\n")
+  cat("Assigned Curve Group:", synthetic_group, "\n")
+  cat("Duration Match Tolerance:", duration_match_tolerance, "years\n")
+  cat("Tenor Constraints: [", min_tenor, ", ", max_tenor, "] years\n\n", sep = "")
+  
+  # Get all trading dates
+  all_dates <- par_data %>%
+    filter(Date >= as.Date(start_date) & Date <= as.Date(end_date)) %>%
+    pull(Date)
+  
+  # Create SCHEDULED purchase dates (every 6 months)
+  scheduled_purchase_dates <- seq(as.Date(start_date), as.Date(end_date), by = "6 months")
+  
+  # Map to ACTUAL trading dates
+  actual_purchase_dates <- sapply(scheduled_purchase_dates, function(target) {
+    find_nearest_trading_date(target, all_dates)
+  })
+  actual_purchase_dates <- as.Date(actual_purchase_dates, origin = "1970-01-01")
+  
+  cat("=== Purchase Schedule ===\n")
+  purchase_schedule <- data.frame(
+    Scheduled = scheduled_purchase_dates,
+    Actual = actual_purchase_dates,
+    Days_Diff = as.numeric(actual_purchase_dates - scheduled_purchase_dates)
+  )
+  print(purchase_schedule)
+  cat("Total scheduled purchases:", length(scheduled_purchase_dates), "\n\n")
+  
+  # Initialize tracking
+  cash_account <- rep(NA, length(all_dates))
+  cash_account[1] <- w0
+  bond_positions <- list()
+  purchased_info <- rep(NA_character_, length(all_dates))
+  
+  # Duration tracking
+  portfolio_duration_history <- rep(NA, length(all_dates))
+  target_duration_history <- rep(NA, length(all_dates))
+  
+  # Logging data frame
+  daily_log <- data.frame(
+    Date = all_dates,
+    n_bonds_held = 0,
+    flags = "",
+    zcb_yield_used = NA,
+    group_used = NA_character_,
+    price_capped = FALSE,
+    abnormal_price_fixed = FALSE,
+    portfolio_change_pct = NA,
+    portfolio_duration = NA,
+    target_duration = NA
+  )
+  
+  # Store last valid prices BY BOND
+  last_valid_prices <- list()
+  bonds_purchased <- character()
+  
+  # Daily rate calculation
+  daily_rate <- (1 + r_f_annual)^(1/365) - 1
+  
+  # ========== PURCHASE LOOP WITH DYNAMIC DURATION-BASED TENOR SELECTION ==========
+  
+  for (i in 1:length(all_dates)) {
+    current_date <- all_dates[i]
+    
+    # --- PURCHASE LOGIC: Create synthetic bond with duration-based tenor ---
+    if (current_date %in% actual_purchase_dates && 
+        !as.character(current_date) %in% bonds_purchased) {
+      
+      bonds_purchased <- c(bonds_purchased, as.character(current_date))
+      
+      is_first_purchase <- (length(bond_positions) == 0)
+      
+      if (is_first_purchase) {
+        cat("\n=== FIRST PURCHASE ===\n")
+        cat("Date:", format(current_date, "%Y-%m-%d"), "\n")
+        
+        # For first purchase: find bond with duration closest to target (10 years)
+        bond_match <- find_bond_with_target_duration(
+          purchase_data = purchase_data,
+          current_date = current_date,
+          target_duration = target_portfolio_duration,
+          synthetic_callable = synthetic_callable,
+          synthetic_coupon = synthetic_coupon,
+          synthetic_tax_prov = synthetic_tax_prov,
+          duration_tolerance = duration_match_tolerance,
+          min_tenor = min_tenor,
+          max_tenor = max_tenor
+        )
+        
+        if (!is.na(bond_match$tenor)) {
+          # Good match found
+          synthetic_tenor <- bond_match$tenor
+          cat("Target Duration:", target_portfolio_duration, "years\n")
+          cat("Matched Duration:", round(bond_match$duration, 2), "years\n")
+          cat("Selected Tenor (YF):", round(synthetic_tenor, 2), "years\n")
+          cat("Matched Yield:", round(bond_match$yield, 2), "%\n")
+          cat("Total Candidates:", bond_match$n_candidates, "\n")
+          cat("After Tenor Filter:", bond_match$n_after_tenor_filter, "\n")
+          cat("Status: MATCHED FROM DATA\n")
+          cat(bond_match$message, "\n")
+        } else {
+          # No good match - use fallback (10-year tenor)
+          synthetic_tenor <- target_portfolio_duration
+          
+          # Convert duration to approximate tenor for better estimation
+          synthetic_tenor <- duration_to_tenor(target_portfolio_duration, 
+                                               coupon_rate = synthetic_coupon)
+          
+          # Ensure fallback tenor is within bounds
+          synthetic_tenor <- pmax(min_tenor, pmin(max_tenor, synthetic_tenor))
+          
+          cat("Target Duration:", target_portfolio_duration, "years\n")
+          cat("WARNING: No bonds within tolerance\n")
+          cat("Total Candidates:", bond_match$n_candidates, "\n")
+          if (!is.null(bond_match$n_after_tenor_filter)) {
+            cat("After Tenor Filter:", bond_match$n_after_tenor_filter, "\n")
+          }
+          cat("Status:", bond_match$status, "\n")
+          if (!is.null(bond_match$message)) {
+            cat(bond_match$message, "\n")
+          }
+          cat("Using FALLBACK tenor:", round(synthetic_tenor, 2), "years (constrained to [", 
+              min_tenor, ", ", max_tenor, "])\n", sep = "")
+        }
+        
+      } else {
+        cat("\n=== SUBSEQUENT PURCHASE #", length(bond_positions) + 1, "===\n")
+        cat("Date:", format(current_date, "%Y-%m-%d"), "\n")
+        
+        # Calculate current portfolio value and duration
+        current_bond_values <- rep(0, length(bond_positions))
+        
+        for (j in 1:length(bond_positions)) {
+          bond <- bond_positions[[j]]
+          
+          if (bond$purchase_date > current_date) {
+            next
+          }
+          
+          days_held <- as.numeric(current_date - bond$purchase_date)
+          years_held <- days_held / 365
+          remaining_tenor <- bond$purchase_tenor - years_held
+          
+          if (remaining_tenor > 0) {
+            # Get cached price
+            cache_key <- paste0("bond_", bond$bond_id)
+            current_price <- last_valid_prices[[cache_key]]
+            if (is.null(current_price)) {
+              current_price <- bond$purchase_price
+            }
+            current_bond_values[j] <- bond$units * current_price
+          }
+        }
+        
+        current_portfolio_value <- sum(current_bond_values, na.rm = TRUE)
+        
+        # Calculate current portfolio duration (without new bond)
+        current_portfolio_duration <- calculate_portfolio_duration(
+          bond_positions = bond_positions,
+          current_date = current_date,
+          current_index = i,
+          bond_values = current_bond_values,
+          new_bond_value = 0,
+          new_bond_duration = 0
+        )
+        
+        cat("Current Portfolio Value: $", round(current_portfolio_value, 2), "\n")
+        cat("Current Portfolio Duration:", round(current_portfolio_duration, 2), "years\n")
+        
+        # Calculate required duration for new bond
+        new_bond_value <- alpha * w0
+        required_duration <- calculate_required_duration(
+          current_portfolio_duration = current_portfolio_duration,
+          current_portfolio_value = current_portfolio_value,
+          new_bond_value = new_bond_value,
+          target_portfolio_duration = target_portfolio_duration
+        )
+        
+        cat("Required New Bond Duration:", round(required_duration, 2), "years\n")
+        
+        # Handle edge cases for required duration
+        if (required_duration <= 0) {
+          cat("WARNING: Required duration is non-positive. Using default (10 years).\n")
+          required_duration <- 10.0
+        }
+        
+        if (required_duration > 30) {
+          cat("WARNING: Required duration very high (", round(required_duration, 2), 
+              "). Capping at 30 years.\n")
+          required_duration <- 30.0
+        }
+        
+        # Try to find bond with target duration
+        bond_match <- find_bond_with_target_duration(
+          purchase_data = purchase_data,
+          current_date = current_date,
+          target_duration = required_duration,
+          synthetic_callable = synthetic_callable,
+          synthetic_coupon = synthetic_coupon,
+          synthetic_tax_prov = synthetic_tax_prov,
+          duration_tolerance = duration_match_tolerance,
+          min_tenor = min_tenor,
+          max_tenor = max_tenor
+        )
+        
+        if (!is.na(bond_match$tenor)) {
+          # Good match found
+          synthetic_tenor <- bond_match$tenor
+          cat("Matched Duration:", round(bond_match$duration, 2), "years\n")
+          cat("Selected Tenor (YF):", round(synthetic_tenor, 2), "years\n")
+          cat("Matched Yield:", round(bond_match$yield, 2), "%\n")
+          cat("Total Candidates:", bond_match$n_candidates, "\n")
+          cat("After Tenor Filter:", bond_match$n_after_tenor_filter, "\n")
+          cat("Status: MATCHED FROM DATA\n")
+          cat(bond_match$message, "\n")
+        } else {
+          # No good match - use calculated required duration as tenor
+          # Convert duration to approximate tenor
+          synthetic_tenor <- duration_to_tenor(required_duration, 
+                                               coupon_rate = synthetic_coupon)
+          
+          # Ensure fallback tenor is within bounds
+          synthetic_tenor <- pmax(min_tenor, pmin(max_tenor, synthetic_tenor))
+          
+          cat("WARNING: No bonds within tolerance\n")
+          cat("Total Candidates:", bond_match$n_candidates, "\n")
+          if (!is.null(bond_match$n_after_tenor_filter)) {
+            cat("After Tenor Filter:", bond_match$n_after_tenor_filter, "\n")
+          }
+          cat("Status:", bond_match$status, "\n")
+          if (!is.null(bond_match$message)) {
+            cat(bond_match$message, "\n")
+          }
+          cat("Using CALCULATED REQUIRED DURATION as tenor:", round(synthetic_tenor, 2), 
+              "years (constrained to [", min_tenor, ", ", max_tenor, "])\n", sep = "")
+        }
+      }
+      
+      # Extract ZERO-COUPON yield using the synthetic bond's GROUP
+      zcb_result <- extract_zcb_yield_safe(
+        current_date = current_date,
+        target_tenor = synthetic_tenor,
+        bond_callable = synthetic_callable,
+        bond_cpn = synthetic_coupon,
+        bond_tax_prov = synthetic_tax_prov,
+        coupon_frequency = coupon_frequency,
+        face_value = face_value
+      )
+      
+      purchase_zcb_yield <- zcb_result$zcb_yield
+      group_used <- zcb_result$group
+      
+      if (!is.na(purchase_zcb_yield)) {
+        # Calculate price using ZERO-COUPON formula
+        purchase_price <- face_value / (1 + purchase_zcb_yield/100)^synthetic_tenor
+        purchase_price <- pmax(min_price, pmin(max_price, purchase_price))
+        
+        units <- (alpha * w0) / purchase_price
+        
+        # Create synthetic bond position
+        new_bond <- data.frame(
+          bond_id = length(bond_positions) + 1,
+          purchase_date = current_date,
+          purchase_index = i,
+          purchase_tenor = synthetic_tenor,
+          units = units,
+          face_value = face_value,
+          maturity_date = current_date + years(ceiling(synthetic_tenor)),
+          purchase_price = purchase_price,
+          purchase_zcb_yield = purchase_zcb_yield,
+          cusip = paste0("SYNTHETIC_", format(current_date, "%Y%m%d")),
+          callable = synthetic_callable,
+          cpn = synthetic_coupon,
+          tax_prov = synthetic_tax_prov,
+          curve_group = group_used
+        )
+        
+        bond_positions[[length(bond_positions) + 1]] <- new_bond
+        
+        # Initialize price cache for this bond
+        cache_key <- paste0("bond_", new_bond$bond_id)
+        last_valid_prices[[cache_key]] <- purchase_price
+        
+        purchased_info[i] <- paste0("Synthetic Bond #", new_bond$bond_id, 
+                                    " | CUSIP: ", new_bond$cusip, 
+                                    " | Tenor: ", round(synthetic_tenor, 2),
+                                    " | Coupon: ", synthetic_coupon, "%",
+                                    " | ZCB Yield: ", round(purchase_zcb_yield, 2), "%",
+                                    " | Price: $", round(purchase_price, 2),
+                                    " | Group: ", group_used)
+        
+        # Deduct from cash
+        cash_account[i] <- cash_account[i] - (alpha * w0)
+        
+        cat("Purchase Confirmed: ", purchased_info[i], "\n")
+      } else {
+        cat("ERROR: Could not extract yield for synthetic bond on", 
+            format(current_date, "%Y-%m-%d"),
+            "- Group:", group_used, "- Flag:", zcb_result$flag, "\n")
+      }
+    }
+    
+    # --- CASH COMPOUNDING ---
+    if (i < length(all_dates)) {
+      cash_account[i + 1] <- cash_account[i] * (1 + daily_rate)
+    }
+  }
+  
+  cat("\n=== Purchase Summary ===\n")
+  cat("Total synthetic bonds purchased:", length(bond_positions), "\n")
+  cat("Expected purchases:", length(scheduled_purchase_dates), "\n\n")
+  
+  # ========== VALUATION LOOP WITH DURATION TRACKING ==========
+  
+  portfolio_value <- rep(NA, length(all_dates))
+  bond_value_daily <- rep(0, length(all_dates))
+  
+  for (i in 1:length(all_dates)) {
+    current_date <- all_dates[i]
+    
+    portfolio_value[i] <- cash_account[i]
+    total_bond_value <- 0
+    all_flags <- character()
+    n_active_bonds <- 0
+    
+    # Track bond values for duration calculation
+    current_bond_values <- rep(0, length(bond_positions))
+    
+    if (length(bond_positions) > 0) {
+      
+      for (j in 1:length(bond_positions)) {
+        bond <- bond_positions[[j]]
+        
+        if (bond$purchase_date > current_date) {
+          next
+        }
+        
+        # Calculate remaining tenor
+        days_held <- as.numeric(current_date - bond$purchase_date)
+        years_held <- days_held / 365
+        remaining_tenor <- bond$purchase_tenor - years_held
+        
+        if (remaining_tenor > 0) {
+          
+          n_active_bonds <- n_active_bonds + 1
+          
+          # Extract ZERO-COUPON yield using bond's GROUP
+          zcb_result <- extract_zcb_yield_safe(
+            current_date = current_date,
+            target_tenor = remaining_tenor,
+            bond_callable = bond$callable,
+            bond_cpn = bond$cpn,
+            bond_tax_prov = bond$tax_prov,
+            coupon_frequency = coupon_frequency,
+            face_value = face_value
+          )
+          
+          tenor_zcb_yield <- zcb_result$zcb_yield
+          flag <- zcb_result$flag
+          group_used <- zcb_result$group
+          
+          # Get previous day's price for this bond
+          cache_key <- paste0("bond_", bond$bond_id)
+          previous_price <- last_valid_prices[[cache_key]]
+          if (is.null(previous_price)) {
+            previous_price <- bond$purchase_price
+          }
+          
+          # Calculate new price
+          if (!is.na(tenor_zcb_yield)) {
+            # Calculate price using ZERO-COUPON formula
+            calculated_price <- face_value / (1 + tenor_zcb_yield/100)^remaining_tenor
+            
+            # ABNORMAL PRICE CHECK #1: Is calculated price within absolute bounds?
+            if (calculated_price < min_price || calculated_price > max_price) {
+              current_price <- previous_price
+              daily_log$abnormal_price_fixed[i] <- TRUE
+              all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":PRICE_BOUNDS_", 
+                                               round(calculated_price, 2)))
+            } else {
+              # ABNORMAL PRICE CHECK #2: Is daily change reasonable?
+              price_change_pct <- abs(calculated_price - previous_price) / previous_price
+              
+              if (price_change_pct > max_daily_price_change) {
+                # Price changed too much - use previous price
+                current_price <- previous_price
+                daily_log$abnormal_price_fixed[i] <- TRUE
+                all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":ABNORMAL_CHANGE_", 
+                                                 round(price_change_pct * 100, 1), "%"))
+              } else {
+                # Price is reasonable
+                current_price <- calculated_price
+                
+                # Update cache
+                last_valid_prices[[cache_key]] <- current_price
+                
+                # Store yield (first bond's info)
+                if (is.na(daily_log$zcb_yield_used[i])) {
+                  daily_log$zcb_yield_used[i] <- tenor_zcb_yield
+                  daily_log$group_used[i] <- group_used
+                }
+              }
+            }
+          } else {
+            # No valid yield - use previous price
+            current_price <- previous_price
+            all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":", flag))
+          }
+          
+          bond_value <- bond$units * current_price
+          current_bond_values[j] <- bond_value
+          total_bond_value <- total_bond_value + bond_value
+        }
+      }
+      
+      bond_value_daily[i] <- total_bond_value
+      portfolio_value[i] <- portfolio_value[i] + total_bond_value
+      
+      # Calculate portfolio duration
+      portfolio_duration <- calculate_portfolio_duration(
+        bond_positions = bond_positions,
+        current_date = current_date,
+        current_index = i,
+        bond_values = current_bond_values,
+        new_bond_value = 0,
+        new_bond_duration = 0
+      )
+      
+      portfolio_duration_history[i] <- portfolio_duration
+      target_duration_history[i] <- target_portfolio_duration
+      
+      daily_log$portfolio_duration[i] <- portfolio_duration
+      daily_log$target_duration[i] <- target_portfolio_duration
+    }
+    
+    # Store logging info
+    daily_log$n_bonds_held[i] <- n_active_bonds
+    if (length(all_flags) > 0) {
+      daily_log$flags[i] <- paste(all_flags, collapse = "; ")
+    }
+    
+    # Calculate portfolio change
+    if (i > 1 && !is.na(portfolio_value[i-1]) && portfolio_value[i-1] > 0) {
+      pct_change <- (portfolio_value[i] - portfolio_value[i-1]) / portfolio_value[i-1]
+      daily_log$portfolio_change_pct[i] <- pct_change * 100
+      
+      # Flag abnormal portfolio changes
+      if (abs(pct_change) > max_daily_portfolio_change) {
+        daily_log$flags[i] <- paste0(daily_log$flags[i], 
+                                     " | ABNORMAL_PORTFOLIO_CHANGE:", 
+                                     round(pct_change * 100, 1), "%")
+      }
+    }
+  }
+  
+  # ========== CREATE FINAL PORTFOLIO DATAFRAME ==========
+  
+  portfolio_df <- data.frame(
+    Date = all_dates,
+    Cash = cash_account,
+    Bonds = bond_value_daily,
+    Portfolio_Value = portfolio_value,
+    Portfolio_Duration = portfolio_duration_history,
+    Target_Duration = target_duration_history,
+    N_Bonds = daily_log$n_bonds_held
+  )
+  
+  # Calculate returns
+  portfolio_df <- portfolio_df %>%
+    mutate(
+      Daily_Return = (Portfolio_Value / lag(Portfolio_Value) - 1) * 100,
+      Cumulative_Return = (Portfolio_Value / w0 - 1) * 100
+    )
+  
+  # ========== SUMMARY STATISTICS ==========
+  
+  final_value <- portfolio_value[length(portfolio_value)]
+  total_return <- (final_value / w0 - 1) * 100
+  
+  cat("\n=== Portfolio Performance Summary ===\n")
+  cat("Initial Capital: $", format(w0, big.mark = ","), "\n", sep = "")
+  cat("Final Portfolio Value: $", format(round(final_value, 2), big.mark = ","), "\n", sep = "")
+  cat("Total Return: ", round(total_return, 2), "%\n", sep = "")
+  cat("Final Cash: $", format(round(cash_account[length(cash_account)], 2), big.mark = ","), "\n", sep = "")
+  cat("Final Bond Value: $", format(round(bond_value_daily[length(bond_value_daily)], 2), big.mark = ","), "\n", sep = "")
+  cat("Average Portfolio Duration: ", round(mean(portfolio_duration_history, na.rm = TRUE), 2), " years\n", sep = "")
+  cat("Target Portfolio Duration: ", target_portfolio_duration, " years\n", sep = "")
+  
+  # ========== CREATE PLOTS ==========
+  
+  cat("\n=== Generating Plots ===\n")
+  
+  # 1. Duration Plot
+  duration_plot <- ggplot(portfolio_df %>% filter(!is.na(Portfolio_Duration)), 
+                         aes(x = Date)) +
+    geom_line(aes(y = Portfolio_Duration, color = "Actual Duration"), size = 1) +
+    geom_hline(aes(yintercept = target_portfolio_duration, color = "Target Duration"), 
+               linetype = "dashed", size = 1) +
+    geom_ribbon(aes(ymin = min_target_duration, ymax = max_target_duration), 
+                alpha = 0.2, fill = "blue") +
+    scale_color_manual(name = "Duration", 
+                      values = c("Actual Duration" = "darkblue", 
+                                "Target Duration" = "red")) +
+    labs(title = "Portfolio Duration Over Time",
+         subtitle = paste0("Target: ", target_portfolio_duration, " years (Range: ", 
+                          min_target_duration, "-", max_target_duration, " years) | Tenor Constraints: [", 
+                          min_tenor, ", ", max_tenor, "] years"),
+         x = "Date",
+         y = "Duration (Years)") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 14))
+  
+  print(duration_plot)
+  
+  # 2. Portfolio Value Plot
+  portfolio_value_plot <- ggplot(portfolio_df, aes(x = Date)) +
+    geom_line(aes(y = Portfolio_Value, color = "Total Portfolio"), size = 1.2) +
+    geom_line(aes(y = Bonds, color = "Bond Value"), size = 1) +
+    geom_line(aes(y = Cash, color = "Cash"), size = 1) +
+    geom_hline(yintercept = w0, linetype = "dashed", color = "gray50", size = 0.8) +
+    scale_color_manual(name = "Component", 
+                      values = c("Total Portfolio" = "black", 
+                                "Bond Value" = "darkgreen", 
+                                "Cash" = "steelblue")) +
+    scale_y_continuous(labels = scales::dollar) +
+    labs(title = "Portfolio Value Over Time",
+         subtitle = "Green Bonds Portfolio with Dynamic Duration-Based Tenor Selection",
+         x = "Date",
+         y = "Value ($)") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 14))
+  
+  print(portfolio_value_plot)
+  
+
+  
+  # 3. Daily Return Distribution Plot
+  daily_return_plot <- ggplot(portfolio_df %>% filter(!is.na(Daily_Return)), 
+                             aes(x = Daily_Return)) +
+    geom_histogram(aes(y = ..density..), bins = 50, fill = "steelblue", alpha = 0.7) +
+    geom_density(color = "darkblue", size = 1) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Daily Return Distribution",
+         subtitle = paste0("Mean: ", round(mean(portfolio_df$Daily_Return, na.rm = TRUE), 3), 
+                          "% | SD: ", round(sd(portfolio_df$Daily_Return, na.rm = TRUE), 3), "%"),
+         x = "Daily Return (%)",
+         y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  
+  print(daily_return_plot)
+  
+  # ========== RETURN RESULTS ==========
+  
+  return(list(
+    portfolio = portfolio_df,
+    bond_positions = bond_positions,
+    daily_log = daily_log,
+    purchase_info = data.frame(
+      Date = all_dates,
+      Info = purchased_info
+    ) %>% filter(!is.na(Info)),
+    duration_plot = duration_plot,
+    portfolio_value_plot = portfolio_value_plot,
+    return_plot = return_plot,
+    daily_return_plot = daily_return_plot,
+    summary = list(
+      initial_capital = w0,
+      final_value = final_value,
+      total_return_pct = total_return,
+      avg_duration = mean(portfolio_duration_history, na.rm = TRUE),
+      target_duration = target_portfolio_duration,
+      n_bonds_purchased = length(bond_positions),
+      final_cash = cash_account[length(cash_account)],
+      final_bonds = bond_value_daily[length(bond_value_daily)],
+      tenor_constraints = c(min_tenor, max_tenor)
+    )
+  ))
+}
+
+
+```
+# ============================================================================
+# Green bonds Example (Test)
+# ============================================================================
+```{r}
+
+cat("\n" , rep("=", 80), "\n")
+cat("EXECUTING GREEN BONDS PORTFOLIO WITH DYNAMIC DURATION-BASED TENOR SELECTION\n")
+cat("FINAL REVISION: Added tenor constraints (5-20 years)\n")
+cat(rep("=", 80), "\n\n")
+
+
+# ============================================================================
+# CREATE PURCHASE GROUPS 
+# ============================================================================
+
+# Rule 1: Tax status and non-callable (for purchasing)
+rule1_data <- California %>%
+  filter(MUNI_TAX_PROV %in% c("FED TAXABLE/ST TAX-EXEMPT"),
+         CALLABLE == "FALSE")
+
+cat("\n=== Purchase Groups Created ===\n")
+cat("rule1_data:", nrow(rule1_data), "bonds\n")
+
+
+
+green_bonds_result <- construct_portfolio_zcb_synthetic_duration(
+  purchase_data = rule1_data,
+  par_data = par_data,
+  w0 = 1000000,
+  alpha = 0.10,
+  start_date = "2020-01-01",
+  end_date = "2024-12-31",
+  r_f_annual = 0.01,
+  target_portfolio_duration = 10.0,
+  min_target_duration = 9.0,
+  max_target_duration = 11.0,
+  min_price = 70,
+  max_price = 120,
+  max_daily_price_change = 0.10,
+  coupon_frequency = 2,
+  face_value = 100,
+  duration_match_tolerance = 2.0,
+  min_tenor = 5.0,
+  max_tenor = 20.0
+)
+
+# Access results
+cat("\n=== Results Available ===\n")
+cat("green_bonds_result$portfolio - Portfolio values and returns over time\n")
+cat("green_bonds_result$bond_positions - List of all bond purchases\n")
+cat("green_bonds_result$daily_log - Detailed daily logs\n")
+cat("green_bonds_result$purchase_info - Purchase information\n")
+cat("green_bonds_result$duration_plot - Duration plot\n")
+cat("green_bonds_result$portfolio_value_plot - Portfolio value plot\n")
+cat("green_bonds_result$return_plot - Cumulative return plot\n")
+cat("green_bonds_result$daily_return_plot - Daily return distribution\n")
+cat("green_bonds_result$summary - Summary statistics\n")
+
+# View portfolio head
+cat("\n=== Portfolio Data (First 10 Rows) ===\n")
+print(head(green_bonds_result$portfolio, 10))
+
+# View purchase info
+cat("\n=== Purchase Information ===\n")
+print(green_bonds_result$purchase_info)
+
+# Print summary
+cat("\n=== Summary Statistics ===\n")
+print(green_bonds_result$summary)
+
+cat("\n" , rep("=", 80), "\n")
+cat("GREEN BONDS PORTFOLIO CONSTRUCTION COMPLETE\n")
+cat(rep("=", 80), "\n\n")
+
+
+```
+
+# ============================================================================
+# TREASURY BONDS PORTFOLIO WITH DYNAMIC DURATION-BASED TENOR SELECTION
+# ============================================================================
+
+
+```{r}
+
+# ============================================================================
+# HELPER FUNCTION: Find nearest trading date (UNCHANGED)
+# ============================================================================
+
+find_nearest_trading_date <- function(target_date, available_dates) {
+  date_diffs <- abs(as.numeric(available_dates - target_date))
+  nearest_idx <- which.min(date_diffs)
+  return(available_dates[nearest_idx])
+}
+
+# ============================================================================
+# HELPER FUNCTION: Get Treasury rate for a specific tenor on a specific date
+# ============================================================================
+
+get_treasury_rate <- function(zero_tby_data, current_date, target_tenor) {
+  # zero_tby columns: "0.083", "0.167", "0.231", "0.333", "0.500", "1", "2", "3",
+  #                  "5", "7", "10", "20", "30"
+  
+  # Get available tenors
+  available_tenors <- as.numeric(colnames(zero_tby_data))
+  
+  # Find closest tenor to target
+  tenor_diff <- abs(available_tenors - target_tenor)
+  closest_idx <- which.min(tenor_diff)
+  closest_tenor <- available_tenors[closest_idx]
+  
+  # Get rate for this date
+  date_index <- which(index(zero_tby_data) == current_date)
+  
+  if (length(date_index) == 0) {
+    return(list(rate = NA, tenor_used = NA, status = "DATE_NOT_FOUND"))
+  }
+  
+  rate <- as.numeric(zero_tby_data[date_index, closest_idx])
+  
+  if (is.na(rate)) {
+    return(list(rate = NA, tenor_used = closest_tenor, status = "RATE_NA"))
+  }
+  
+  return(list(
+    rate = rate,
+    tenor_used = closest_tenor,
+    status = "OK"
+  ))
+}
+
+# ============================================================================
+# HELPER FUNCTION: Calculate portfolio duration for Treasury bonds
+# ============================================================================
+
+calculate_treasury_portfolio_duration <- function(bond_positions, 
+                                                  current_date,
+                                                  bond_values) {
+  
+  if (length(bond_positions) == 0) {
+    return(0)
+  }
+  
+  total_value <- sum(bond_values, na.rm = TRUE)
+  
+  if (total_value == 0) {
+    return(0)
+  }
+  
+  weighted_duration <- 0
+  
+  # For Treasury zero-coupon bonds, duration = remaining maturity
+  for (j in 1:length(bond_positions)) {
+    bond <- bond_positions[[j]]
+    
+    if (bond$purchase_date > current_date) {
+      next
+    }
+    
+    # Calculate remaining tenor (duration)
+    days_held <- as.numeric(current_date - bond$purchase_date)
+    years_held <- days_held / 365
+    remaining_tenor <- bond$purchase_tenor - years_held
+    
+    if (remaining_tenor > 0 && !is.na(bond_values[j]) && bond_values[j] > 0) {
+      # For zero-coupon bonds: duration = maturity
+      bond_duration <- remaining_tenor
+      
+      weight <- bond_values[j] / total_value
+      weighted_duration <- weighted_duration + (weight * bond_duration)
+    }
+  }
+  
+  return(weighted_duration)
+}
+
+# ============================================================================
+# HELPER FUNCTION: Calculate required duration for new bond
+# ============================================================================
+
+calculate_required_duration <- function(current_portfolio_duration,
+                                       current_portfolio_value,
+                                       new_bond_value,
+                                       target_portfolio_duration) {
+  
+  total_value <- current_portfolio_value + new_bond_value
+  
+  if (total_value == 0) {
+    return(target_portfolio_duration)
+  }
+  
+  # Weighted average formula:
+  # target_duration = (current_duration * current_value + new_duration * new_value) / total_value
+  # Solve for new_duration:
+  
+  required_duration <- (target_portfolio_duration * total_value - 
+                       current_portfolio_duration * current_portfolio_value) / new_bond_value
+  
+  return(required_duration)
+}
+
+# ============================================================================
+# HELPER FUNCTION: Select Treasury tenor based on target duration with constraints
+# ============================================================================
+
+select_treasury_tenor <- function(target_duration,
+                                  available_tenors = c(0.083, 0.167, 0.231, 0.333, 0.5, 
+                                                      1, 2, 3, 5, 7, 10, 20, 30),
+                                  min_tenor = 5.0,
+                                  max_tenor = 20.0) {
+  
+  # Filter tenors within constraints
+  valid_tenors <- available_tenors[available_tenors >= min_tenor & available_tenors <= max_tenor]
+  
+  if (length(valid_tenors) == 0) {
+    # No valid tenors - return closest to target within overall range
+    if (target_duration < min_tenor) {
+      return(list(tenor = min_tenor, status = "CAPPED_AT_MIN"))
+    } else if (target_duration > max_tenor) {
+      return(list(tenor = max_tenor, status = "CAPPED_AT_MAX"))
+    } else {
+      return(list(tenor = target_duration, status = "NO_VALID_TENORS"))
+    }
+  }
+  
+  # Find closest valid tenor to target
+  tenor_diff <- abs(valid_tenors - target_duration)
+  closest_idx <- which.min(tenor_diff)
+  selected_tenor <- valid_tenors[closest_idx]
+  
+  return(list(
+    tenor = selected_tenor,
+    status = "OK",
+    n_valid_tenors = length(valid_tenors)
+  ))
+}
+
+# ============================================================================
+# MAIN FUNCTION: Treasury Portfolio Construction with Duration-Based Tenor Selection
+# ============================================================================
+
+construct_treasury_portfolio_duration <- function(zero_tby_data,
+                                                  w0 = 1000000,
+                                                  alpha = 0.10,
+                                                  start_date = "2020-01-01",
+                                                  end_date = "2024-12-31",
+                                                  r_f_annual = 0.01,
+                                                  target_portfolio_duration = 10.0,
+                                                  min_target_duration = 9.0,
+                                                  max_target_duration = 11.0,
+                                                  min_price = 20,
+                                                  max_price = 150,
+                                                  max_daily_price_change = 0.10,
+                                                  max_daily_portfolio_change = 0.20,
+                                                  face_value = 100,
+                                                  min_tenor = 5.0,
+                                                  max_tenor = 20.0) {
+  
+  cat("\n=== Treasury Bond Portfolio Configuration ===\n")
+  cat("Target Portfolio Duration:", target_portfolio_duration, "years\n")
+  cat("Duration Range:", min_target_duration, "-", max_target_duration, "years\n")
+  cat("Tenor Constraints: [", min_tenor, ", ", max_tenor, "] years\n", sep = "")
+  cat("Note: Treasury bonds are zero-coupon, so Duration = Maturity\n\n")
+  
+  # Get all trading dates
+  all_dates <- index(zero_tby_data)
+  all_dates <- all_dates[all_dates >= as.Date(start_date) & all_dates <= as.Date(end_date)]
+  
+  # Create SCHEDULED purchase dates (every 6 months)
+  scheduled_purchase_dates <- seq(as.Date(start_date), as.Date(end_date), by = "6 months")
+  
+  # Map to ACTUAL trading dates
+  actual_purchase_dates <- sapply(scheduled_purchase_dates, function(target) {
+    find_nearest_trading_date(target, all_dates)
+  })
+  actual_purchase_dates <- as.Date(actual_purchase_dates, origin = "1970-01-01")
+  
+  cat("=== Purchase Schedule ===\n")
+  purchase_schedule <- data.frame(
+    Scheduled = scheduled_purchase_dates,
+    Actual = actual_purchase_dates,
+    Days_Diff = as.numeric(actual_purchase_dates - scheduled_purchase_dates)
+  )
+  print(purchase_schedule)
+  cat("Total scheduled purchases:", length(scheduled_purchase_dates), "\n\n")
+  
+  # Initialize tracking
+  cash_account <- rep(NA, length(all_dates))
+  cash_account[1] <- w0
+  bond_positions <- list()
+  purchased_info <- rep(NA_character_, length(all_dates))
+  
+  # Duration tracking
+  portfolio_duration_history <- rep(NA, length(all_dates))
+  target_duration_history <- rep(NA, length(all_dates))
+  
+  # Logging data frame
+  daily_log <- data.frame(
+    Date = all_dates,
+    n_bonds_held = 0,
+    flags = "",
+    treasury_rate_used = NA,
+    price_capped = FALSE,
+    abnormal_price_fixed = FALSE,
+    portfolio_change_pct = NA,
+    portfolio_duration = NA,
+    target_duration = NA
+  )
+  
+  # Store last valid prices BY BOND
+  last_valid_prices <- list()
+  bonds_purchased <- character()
+  
+  # Daily rate calculation
+  daily_rate <- (1 + r_f_annual)^(1/365) - 1
+  
+  # ========== PURCHASE LOOP WITH DYNAMIC DURATION-BASED TENOR SELECTION ==========
+  
+  for (i in 1:length(all_dates)) {
+    current_date <- all_dates[i]
+    
+    # --- PURCHASE LOGIC: Create Treasury bond with duration-based tenor ---
+    if (current_date %in% actual_purchase_dates && 
+        !as.character(current_date) %in% bonds_purchased) {
+      
+      bonds_purchased <- c(bonds_purchased, as.character(current_date))
+      
+      is_first_purchase <- (length(bond_positions) == 0)
+      
+      if (is_first_purchase) {
+        cat("\n=== FIRST PURCHASE ===\n")
+        cat("Date:", format(current_date, "%Y-%m-%d"), "\n")
+        cat("Target Duration:", target_portfolio_duration, "years\n")
+        
+        # For first purchase: select tenor closest to target duration (10 years)
+        # Since duration = maturity for zero-coupon bonds
+        tenor_selection <- select_treasury_tenor(
+          target_duration = target_portfolio_duration,
+          min_tenor = min_tenor,
+          max_tenor = max_tenor
+        )
+        
+        selected_tenor <- tenor_selection$tenor
+        
+        cat("Selected Tenor:", selected_tenor, "years\n")
+        cat("Status:", tenor_selection$status, "\n")
+        if (!is.null(tenor_selection$n_valid_tenors)) {
+          cat("Valid Tenors Available:", tenor_selection$n_valid_tenors, "\n")
+        }
+        
+      } else {
+        cat("\n=== SUBSEQUENT PURCHASE #", length(bond_positions) + 1, "===\n")
+        cat("Date:", format(current_date, "%Y-%m-%d"), "\n")
+        
+        # Calculate current portfolio value and duration
+        current_bond_values <- rep(0, length(bond_positions))
+        
+        for (j in 1:length(bond_positions)) {
+          bond <- bond_positions[[j]]
+          
+          if (bond$purchase_date > current_date) {
+            next
+          }
+          
+          days_held <- as.numeric(current_date - bond$purchase_date)
+          years_held <- days_held / 365
+          remaining_tenor <- bond$purchase_tenor - years_held
+          
+          if (remaining_tenor > 0) {
+            # Get cached price
+            cache_key <- paste0("bond_", bond$bond_id)
+            current_price <- last_valid_prices[[cache_key]]
+            if (is.null(current_price)) {
+              current_price <- bond$purchase_price
+            }
+            current_bond_values[j] <- bond$units * current_price
+          }
+        }
+        
+        current_portfolio_value <- sum(current_bond_values, na.rm = TRUE)
+        
+        # Calculate current portfolio duration (without new bond)
+        current_portfolio_duration <- calculate_treasury_portfolio_duration(
+          bond_positions = bond_positions,
+          current_date = current_date,
+          bond_values = current_bond_values
+        )
+        
+        cat("Current Portfolio Value: $", round(current_portfolio_value, 2), "\n")
+        cat("Current Portfolio Duration:", round(current_portfolio_duration, 2), "years\n")
+        
+        # Calculate required duration for new bond
+        new_bond_value <- alpha * w0
+        required_duration <- calculate_required_duration(
+          current_portfolio_duration = current_portfolio_duration,
+          current_portfolio_value = current_portfolio_value,
+          new_bond_value = new_bond_value,
+          target_portfolio_duration = target_portfolio_duration
+        )
+        
+        cat("Required New Bond Duration:", round(required_duration, 2), "years\n")
+        
+        # Handle edge cases for required duration
+        if (required_duration <= 0) {
+          cat("WARNING: Required duration is non-positive. Using default (10 years).\n")
+          required_duration <- 10.0
+        }
+        
+        if (required_duration > 30) {
+          cat("WARNING: Required duration very high (", round(required_duration, 2), 
+              "). Capping at 30 years.\n")
+          required_duration <- 30.0
+        }
+        
+        # Select Treasury tenor based on required duration
+        # For Treasury bonds: duration = maturity
+        tenor_selection <- select_treasury_tenor(
+          target_duration = required_duration,
+          min_tenor = min_tenor,
+          max_tenor = max_tenor
+        )
+        
+        selected_tenor <- tenor_selection$tenor
+        
+        cat("Selected Tenor:", selected_tenor, "years\n")
+        cat("Status:", tenor_selection$status, "\n")
+        if (!is.null(tenor_selection$n_valid_tenors)) {
+          cat("Valid Tenors Available:", tenor_selection$n_valid_tenors, "\n")
+        }
+      }
+      
+      # Get Treasury rate for selected tenor
+      rate_result <- get_treasury_rate(
+        zero_tby_data = zero_tby_data,
+        current_date = current_date,
+        target_tenor = selected_tenor
+      )
+      
+      if (!is.na(rate_result$rate)) {
+        # Treasury rate is already zero rate
+        treasury_rate <- rate_result$rate
+        tenor_used <- rate_result$tenor_used
+        
+        # Calculate price using zero-coupon formula
+        # P = Face / (1 + r)^T
+        purchase_price <- face_value / (1 + treasury_rate/100)^tenor_used
+        purchase_price <- pmax(min_price, pmin(max_price, purchase_price))
+        
+        units <- (alpha * w0) / purchase_price
+        
+        # Create Treasury bond position
+        new_bond <- data.frame(
+          bond_id = length(bond_positions) + 1,
+          purchase_date = current_date,
+          purchase_index = i,
+          purchase_tenor = tenor_used,
+          units = units,
+          face_value = face_value,
+          maturity_date = current_date + years(ceiling(tenor_used)),
+          purchase_price = purchase_price,
+          purchase_rate = treasury_rate,
+          cusip = paste0("TREASURY_", format(current_date, "%Y%m%d"))
+        )
+        
+        bond_positions[[length(bond_positions) + 1]] <- new_bond
+        
+        # Initialize price cache for this bond
+        cache_key <- paste0("bond_", new_bond$bond_id)
+        last_valid_prices[[cache_key]] <- purchase_price
+        
+        purchased_info[i] <- paste0("Treasury Bond #", new_bond$bond_id, 
+                                    " | CUSIP: ", new_bond$cusip, 
+                                    " | Tenor: ", round(tenor_used, 2),
+                                    " | Rate: ", round(treasury_rate, 2), "%",
+                                    " | Price: $", round(purchase_price, 2))
+        
+        # Deduct from cash
+        cash_account[i] <- cash_account[i] - (alpha * w0)
+        
+        cat("Purchase Confirmed: ", purchased_info[i], "\n")
+      } else {
+        cat("ERROR: Could not get Treasury rate for tenor", selected_tenor, "on", 
+            format(current_date, "%Y-%m-%d"), "- Status:", rate_result$status, "\n")
+      }
+    }
+    
+    # --- CASH COMPOUNDING ---
+    if (i < length(all_dates)) {
+      cash_account[i + 1] <- cash_account[i] * (1 + daily_rate)
+    }
+  }
+  
+  cat("\n=== Purchase Summary ===\n")
+  cat("Total Treasury bonds purchased:", length(bond_positions), "\n")
+  cat("Expected purchases:", length(scheduled_purchase_dates), "\n\n")
+  
+  # ========== VALUATION LOOP WITH DURATION TRACKING ==========
+  
+  portfolio_value <- rep(NA, length(all_dates))
+  bond_value_daily <- rep(0, length(all_dates))
+  
+  for (i in 1:length(all_dates)) {
+    current_date <- all_dates[i]
+    
+    portfolio_value[i] <- cash_account[i]
+    total_bond_value <- 0
+    all_flags <- character()
+    n_active_bonds <- 0
+    
+    # Track bond values for duration calculation
+    current_bond_values <- rep(0, length(bond_positions))
+    
+    if (length(bond_positions) > 0) {
+      
+      for (j in 1:length(bond_positions)) {
+        bond <- bond_positions[[j]]
+        
+        if (bond$purchase_date > current_date) {
+          next
+        }
+        
+        # Calculate remaining tenor
+        days_held <- as.numeric(current_date - bond$purchase_date)
+        years_held <- days_held / 365
+        remaining_tenor <- bond$purchase_tenor - years_held
+        
+        if (remaining_tenor > 0) {
+          
+          n_active_bonds <- n_active_bonds + 1
+          
+          # Get current Treasury rate for remaining tenor
+          rate_result <- get_treasury_rate(
+            zero_tby_data = zero_tby_data,
+            current_date = current_date,
+            target_tenor = remaining_tenor
+          )
+          
+          # Get previous day's price for this bond
+          cache_key <- paste0("bond_", bond$bond_id)
+          previous_price <- last_valid_prices[[cache_key]]
+          if (is.null(previous_price)) {
+            previous_price <- bond$purchase_price
+          }
+          
+          # Calculate new price
+          if (!is.na(rate_result$rate)) {
+            # Calculate price using zero-coupon formula
+            calculated_price <- face_value / (1 + rate_result$rate/100)^rate_result$tenor_used
+            
+            # ABNORMAL PRICE CHECK #1: Is calculated price within absolute bounds?
+            if (calculated_price < min_price || calculated_price > max_price) {
+              current_price <- previous_price
+              daily_log$abnormal_price_fixed[i] <- TRUE
+              all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":PRICE_BOUNDS_", 
+                                               round(calculated_price, 2)))
+            } else {
+              # ABNORMAL PRICE CHECK #2: Is daily change reasonable?
+              price_change_pct <- abs(calculated_price - previous_price) / previous_price
+              
+              if (price_change_pct > max_daily_price_change) {
+                # Price changed too much - use previous price
+                current_price <- previous_price
+                daily_log$abnormal_price_fixed[i] <- TRUE
+                all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":ABNORMAL_CHANGE_", 
+                                                 round(price_change_pct * 100, 1), "%"))
+              } else {
+                # Price is reasonable
+                current_price <- calculated_price
+                
+                # Update cache
+                last_valid_prices[[cache_key]] <- current_price
+                
+                # Store rate (first bond's info)
+                if (is.na(daily_log$treasury_rate_used[i])) {
+                  daily_log$treasury_rate_used[i] <- rate_result$rate
+                }
+              }
+            }
+          } else {
+            # No valid rate - use previous price
+            current_price <- previous_price
+            all_flags <- c(all_flags, paste0("Bond", bond$bond_id, ":", rate_result$status))
+          }
+          
+          bond_value <- bond$units * current_price
+          current_bond_values[j] <- bond_value
+          total_bond_value <- total_bond_value + bond_value
+        }
+      }
+      
+      bond_value_daily[i] <- total_bond_value
+      portfolio_value[i] <- portfolio_value[i] + total_bond_value
+      
+      # Calculate portfolio duration (for Treasury: duration = weighted average maturity)
+      portfolio_duration <- calculate_treasury_portfolio_duration(
+        bond_positions = bond_positions,
+        current_date = current_date,
+        bond_values = current_bond_values
+      )
+      
+      portfolio_duration_history[i] <- portfolio_duration
+      target_duration_history[i] <- target_portfolio_duration
+      
+      daily_log$portfolio_duration[i] <- portfolio_duration
+      daily_log$target_duration[i] <- target_portfolio_duration
+    }
+    
+    # Store logging info
+    daily_log$n_bonds_held[i] <- n_active_bonds
+    if (length(all_flags) > 0) {
+      daily_log$flags[i] <- paste(all_flags, collapse = "; ")
+    }
+    
+    # Calculate portfolio change
+    if (i > 1 && !is.na(portfolio_value[i-1]) && portfolio_value[i-1] > 0) {
+      pct_change <- (portfolio_value[i] - portfolio_value[i-1]) / portfolio_value[i-1]
+      daily_log$portfolio_change_pct[i] <- pct_change * 100
+      
+      # Flag abnormal portfolio changes
+      if (abs(pct_change) > max_daily_portfolio_change) {
+        daily_log$flags[i] <- paste0(daily_log$flags[i], 
+                                     " | ABNORMAL_PORTFOLIO_CHANGE:", 
+                                     round(pct_change * 100, 1), "%")
+      }
+    }
+  }
+  
+  # ========== CREATE FINAL PORTFOLIO DATAFRAME ==========
+  
+  portfolio_df <- data.frame(
+    Date = all_dates,
+    Cash = cash_account,
+    Bonds = bond_value_daily,
+    Portfolio_Value = portfolio_value,
+    Portfolio_Duration = portfolio_duration_history,
+    Target_Duration = target_duration_history,
+    N_Bonds = daily_log$n_bonds_held
+  )
+  
+  # Calculate returns
+  portfolio_df <- portfolio_df %>%
+    mutate(
+      Daily_Return = (Portfolio_Value / lag(Portfolio_Value) - 1) * 100,
+      Cumulative_Return = (Portfolio_Value / w0 - 1) * 100
+    )
+  
+  # ========== SUMMARY STATISTICS ==========
+  
+  final_value <- portfolio_value[length(portfolio_value)]
+  total_return <- (final_value / w0 - 1) * 100
+  
+  cat("\n=== Portfolio Performance Summary ===\n")
+  cat("Initial Capital: $", format(w0, big.mark = ","), "\n", sep = "")
+  cat("Final Portfolio Value: $", format(round(final_value, 2), big.mark = ","), "\n", sep = "")
+  cat("Total Return: ", round(total_return, 2), "%\n", sep = "")
+  cat("Final Cash: $", format(round(cash_account[length(cash_account)], 2), big.mark = ","), "\n", sep = "")
+  cat("Final Bond Value: $", format(round(bond_value_daily[length(bond_value_daily)], 2), big.mark = ","), "\n", sep = "")
+  cat("Average Portfolio Duration: ", round(mean(portfolio_duration_history, na.rm = TRUE), 2), " years\n", sep = "")
+  cat("Target Portfolio Duration: ", target_portfolio_duration, " years\n", sep = "")
+  
+  # ========== CREATE PLOTS ==========
+  
+  cat("\n=== Generating Plots ===\n")
+  
+  # 1. Duration Plot
+  duration_plot <- ggplot(portfolio_df %>% filter(!is.na(Portfolio_Duration)), 
+                         aes(x = Date)) +
+    geom_line(aes(y = Portfolio_Duration, color = "Actual Duration"), size = 1) +
+    geom_hline(aes(yintercept = target_portfolio_duration, color = "Target Duration"), 
+               linetype = "dashed", size = 1) +
+    geom_ribbon(aes(ymin = min_target_duration, ymax = max_target_duration), 
+                alpha = 0.2, fill = "blue") +
+    scale_color_manual(name = "Duration", 
+                      values = c("Actual Duration" = "darkblue", 
+                                "Target Duration" = "red")) +
+    labs(title = "Treasury Portfolio Duration Over Time",
+         subtitle = paste0("Target: ", target_portfolio_duration, " years (Range: ", 
+                          min_target_duration, "-", max_target_duration, " years) | Tenor Constraints: [", 
+                          min_tenor, ", ", max_tenor, "] years"),
+         x = "Date",
+         y = "Duration (Years)") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 14))
+  
+  print(duration_plot)
+  
+  #2. Portfolio Value Plot
+  portfolio_value_plot <- ggplot(portfolio_df, aes(x = Date)) +
+    geom_line(aes(y = Portfolio_Value, color = "Total Portfolio"), size = 1.2) +
+    geom_line(aes(y = Bonds, color = "Bond Value"), size = 1) +
+    geom_line(aes(y = Cash, color = "Cash"), size = 1) +
+    geom_hline(yintercept = w0, linetype = "dashed", color = "gray50", size = 0.8) +
+    scale_color_manual(name = "Component",
+                      values = c("Total Portfolio" = "black",
+                                "Bond Value" = "darkgreen",
+                                "Cash" = "steelblue")) +
+    scale_y_continuous(labels = scales::dollar) +
+    labs(title = "Treasury Portfolio Value Over Time",
+         subtitle = "Treasury Bonds with Dynamic Duration-Based Tenor Selection",
+         x = "Date",
+         y = "Value ($)") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 14))
+
+  print(portfolio_value_plot)
+  
+  # 3. Cumulative Return Plot
+  return_plot <- ggplot(portfolio_df %>% filter(!is.na(Cumulative_Return)), 
+                       aes(x = Date, y = Cumulative_Return)) +
+    geom_line(color = "darkgreen", size = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = "Cumulative Treasury Portfolio Return Over Time",
+         subtitle = paste0("Total Return: ", round(total_return, 2), "%"),
+         x = "Date",
+         y = "Cumulative Return (%)") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  
+  print(return_plot)
+  
+  # 4. Daily Return Distribution Plot
+  daily_return_plot <- ggplot(portfolio_df %>% filter(!is.na(Daily_Return)), 
+                             aes(x = Daily_Return)) +
+    geom_histogram(aes(y = ..density..), bins = 50, fill = "steelblue", alpha = 0.7) +
+    geom_density(color = "darkblue", size = 1) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Daily Return Distribution - Treasury Portfolio",
+         subtitle = paste0("Mean: ", round(mean(portfolio_df$Daily_Return, na.rm = TRUE), 3), 
+                          "% | SD: ", round(sd(portfolio_df$Daily_Return, na.rm = TRUE), 3), "%"),
+         x = "Daily Return (%)",
+         y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  
+  print(daily_return_plot)
+  
+  # ========== RETURN RESULTS ==========
+  
+  return(list(
+    portfolio = portfolio_df,
+    bond_positions = bond_positions,
+    daily_log = daily_log,
+    purchase_info = data.frame(
+      Date = all_dates,
+      Info = purchased_info
+    ) %>% filter(!is.na(Info)),
+    duration_plot = duration_plot,
+    portfolio_value_plot = portfolio_value_plot,
+    return_plot = return_plot,
+    daily_return_plot = daily_return_plot,
+    summary = list(
+      initial_capital = w0,
+      final_value = final_value,
+      total_return_pct = total_return,
+      avg_duration = mean(portfolio_duration_history, na.rm = TRUE),
+      target_duration = target_portfolio_duration,
+      n_bonds_purchased = length(bond_positions),
+      final_cash = cash_account[length(cash_account)],
+      final_bonds = bond_value_daily[length(bond_value_daily)],
+      tenor_constraints = c(min_tenor, max_tenor)
+    )
+  ))
+}
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+cat("\n" , rep("=", 80), "\n")
+cat("EXECUTING TREASURY BONDS PORTFOLIO WITH DYNAMIC DURATION-BASED TENOR SELECTION\n")
+cat("Treasury rates are zero rates, Duration = Maturity\n")
+cat(rep("=", 80), "\n\n")
+
+treasury_result <- construct_treasury_portfolio_duration(
+  zero_tby_data = zero_tby,
+  w0 = 1000000,
+  alpha = 0.10,
+  start_date = "2020-01-01",
+  end_date = "2024-12-31",
+  r_f_annual = 0.01,
+  target_portfolio_duration = 10.0,
+  min_target_duration = 9.0,
+  max_target_duration = 11.0,
+  min_price = 70,
+  max_price = 130,
+  max_daily_price_change = 0.10,
+  face_value = 100,
+  min_tenor = 5.0,
+  max_tenor = 20.0
+)
+
+# Access results
+cat("\n=== Results Available ===\n")
+cat("treasury_result$portfolio - Portfolio values and returns over time\n")
+cat("treasury_result$bond_positions - List of all bond purchases\n")
+cat("treasury_result$daily_log - Detailed daily logs\n")
+cat("treasury_result$purchase_info - Purchase information\n")
+cat("treasury_result$duration_plot - Duration plot\n")
+cat("treasury_result$portfolio_value_plot - Portfolio value plot\n")
+cat("treasury_result$return_plot - Cumulative return plot\n")
+cat("treasury_result$daily_return_plot - Daily return distribution\n")
+cat("treasury_result$summary - Summary statistics\n")
+
+# View portfolio head
+cat("\n=== Portfolio Data (First 10 Rows) ===\n")
+print(head(treasury_result$portfolio, 10))
+
+# View purchase info
+cat("\n=== Purchase Information ===\n")
+print(treasury_result$purchase_info)
+
+# Print summary
+cat("\n=== Summary Statistics ===\n")
+print(treasury_result$summary)
+
+cat("\n" , rep("=", 80), "\n")
+cat("TREASURY BONDS PORTFOLIO CONSTRUCTION COMPLETE\n")
+cat(rep("=", 80), "\n\n")
+
+
+
+```
+
+# ============================================================================
+# MULTI-PORTFOLIO COMPARISON WITH DURATION-BASED TENOR SELECTION
+# ============================================================================
+
+```{r}
+
+# ============================================================================
+# GLOBAL PARAMETERS FOR PORTFOLIO CONSTRUCTION
+# ============================================================================
+
+r_f_annual_param <- 0.01  # Annual risk-free rate 
+w0 <- 1000000              # Initial wealth
+alpha_param <- 0.10        # Alpha parameter
+
+cat("\n=== Portfolio Construction Parameters ===\n")
+cat("Initial Investment: $", format(w0, big.mark = ","), "\n")
+cat("Risk-Free Rate (Annual): ", r_f_annual_param * 100, "%\n")
+cat("Alpha: ", alpha_param, "\n\n")
+
+# ============================================================================
+# DEFINE MULTIPLE PURCHASE GROUPS
+# ============================================================================
+
+purchase_groups <- list(
+  Group1 = California %>%
+    filter(MUNI_TAX_PROV %in% c("FED TAXABLE/ST TAX-EXEMPT"), 
+           CALLABLE == "FALSE"),
+  
+  Group2 = California %>%
+    filter(S_AT_Iss == "Higher than 100",
+           CALLABLE == "FALSE"),
+  
+  Group3 = California %>%
+    filter(years_to_maturity_int == "Higher than 14.4",
+           CALLABLE == "FALSE"),
+  
+  Group4 = California %>%
+    filter(DAM == "Higher than 7",
+           CALLABLE == "FALSE")
+)
+
+cat("\n=== Purchase Groups Defined ===\n")
+for (group_name in names(purchase_groups)) {
+  cat(group_name, ": ", nrow(purchase_groups[[group_name]]), " bonds\n", sep = "")
+}
+cat("\n")
+
+# ============================================================================
+# RUN PORTFOLIO CONSTRUCTION FOR ALL GREEN BOND GROUPS
+# ============================================================================
+
+cat("\n", rep("=", 80), "\n")
+cat("RUNNING DURATION-BASED PORTFOLIO CONSTRUCTION FOR ALL GROUPS\n")
+cat(rep("=", 80), "\n\n")
+
+all_results <- list()
+
+for (group_name in names(purchase_groups)) {
+  
+  cat("\n", rep("-", 80), "\n")
+  cat("PROCESSING:", group_name, "\n")
+  cat(rep("-", 80), "\n")
+  cat("Number of bonds in purchase group:", nrow(purchase_groups[[group_name]]), "\n")
+  
+  # Show characteristics of this group
+  cat("\nGroup Characteristics:\n")
+  cat("  Median Coupon:", round(median(purchase_groups[[group_name]]$CPN, na.rm = TRUE), 2), "%\n")
+  
+  tax_summary <- purchase_groups[[group_name]] %>%
+    group_by(MUNI_TAX_PROV) %>%
+    summarise(n = n_distinct(ID_CUSIP), .groups = 'drop') %>%
+    arrange(desc(n))
+  
+  cat("  Tax Provinces:\n")
+  print(tax_summary)
+  cat("  Most common:", tax_summary$MUNI_TAX_PROV[1], "\n")
+  
+  # Run portfolio construction with duration-based tenor selection
+  result <- construct_portfolio_zcb_synthetic_duration(
+    purchase_data = purchase_groups[[group_name]],
+    par_data = par_data,
+    w0 = w0,
+    alpha = alpha_param,
+    start_date = "2020-01-01",
+    end_date = "2024-12-31",
+    r_f_annual = r_f_annual_param,
+    target_portfolio_duration = 10.0,
+    min_target_duration = 9.0,
+    max_target_duration = 11.0,
+    min_price = 70,
+    max_price = 130,
+    max_daily_price_change = 0.03,
+    coupon_frequency = 2,
+    face_value = 100,
+    duration_match_tolerance = 2.0,
+    min_tenor = 5.0,
+    max_tenor = 20.0
+  )
+  
+  all_results[[group_name]] <- result
+  
+  cat("\n", rep("-", 80), "\n\n")
+}
+
+# ============================================================================
+# RUN TREASURY PORTFOLIO CONSTRUCTION
+# ============================================================================
+
+cat("\n", rep("=", 80), "\n")
+cat("RUNNING TREASURY PORTFOLIO CONSTRUCTION\n")
+cat(rep("=", 80), "\n\n")
+
+treasury_result <- construct_treasury_portfolio_duration(
+  zero_tby_data = zero_tby,
+  w0 = w0,
+  alpha = alpha_param,
+  start_date = "2020-01-01",
+  end_date = "2024-12-31",
+  r_f_annual = r_f_annual_param,
+  target_portfolio_duration = 10.0,
+  min_target_duration = 9.0,
+  max_target_duration = 11.0,
+  min_price = 20,
+  max_price = 150,
+  max_daily_price_change = 0.10,
+  face_value = 100,
+  min_tenor = 5.0,
+  max_tenor = 20.0
+)
+
+
+
+```
+
+# ============================================================================
+# PORTFOLIO COMPARISON: ALL GROUPS + TREASURY (Fig 10)
+# ============================================================================
+```{r}
+cat("\n", rep("=", 80), "\n")
+cat("COMBINING ALL PORTFOLIOS FOR COMPARISON\n")
+cat(rep("=", 80), "\n\n")
+
+# Combine all portfolios including Treasury
+comparison_df <- data.frame(Date = all_results[[1]]$portfolio$Date)
+
+for (group_name in names(all_results)) {
+  comparison_df[[group_name]] <- all_results[[group_name]]$portfolio$Portfolio_Value
+}
+
+# Add Treasury
+comparison_df$Treasury <- treasury_result$portfolio$Portfolio_Value
+
+# Add Year column for yearly analysis
+comparison_df$Year <- year(comparison_df$Date)
+
+# Convert to long format and calculate cumulative returns
+plot_data <- comparison_df %>%
+  pivot_longer(cols = -c(Date, Year),
+               names_to = "Portfolio",
+               values_to = "Portfolio_Value") %>%
+  mutate(Cumulative_Return = (Portfolio_Value - w0) / w0 * 100)
+
+# Create flexible color palette
+n_portfolios <- length(unique(plot_data$Portfolio))
+n_green_groups <- n_portfolios - 1
+
+# Green shades for bond groups + navy for Treasury
+color_palette <- c(
+  colorRampPalette(c("darkgreen", "limegreen"))(n_green_groups),
+  "navy"
+)
+names(color_palette) <- unique(plot_data$Portfolio)
+
+cat("Portfolios included in comparison:\n")
+print(unique(plot_data$Portfolio))
+cat("\n")
+
+# ============================================================================
+# COMPARISON PLOTS (Framed, No Titles)
+# ============================================================================
+
+cat("=== Generating Comparison Plots ===\n\n")
+
+# ---------------------------------------------------------------------------
+# Plot 1: Portfolio Values
+# ---------------------------------------------------------------------------
+value_comparison_plot <- ggplot(plot_data, aes(x = Date, y = Portfolio_Value, color = Portfolio)) +
+  geom_line(size = 1.2) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_color_manual(values = color_palette) +
+  labs(x = "Date",
+       y = "Portfolio Value ($)",
+       color = "Portfolio") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+
+print(value_comparison_plot)
+
+# ---------------------------------------------------------------------------
+# Plot 2: Cumulative Returns
+# ---------------------------------------------------------------------------
+return_comparison_plot <- ggplot(plot_data, aes(x = Date, y = Cumulative_Return, color = Portfolio)) +
+  geom_line(size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = color_palette) +
+  labs(x = "Date",
+       y = "Cumulative Return (%)",
+       color = "Portfolio") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+
+print(return_comparison_plot)
+
+# ---------------------------------------------------------------------------
+# Plot 3: Duration Comparison
+# ---------------------------------------------------------------------------
+duration_data <- data.frame(Date = all_results[[1]]$portfolio$Date)
+
+for (group_name in names(all_results)) {
+  duration_data[[group_name]] <- all_results[[group_name]]$portfolio$Portfolio_Duration
+}
+duration_data$Treasury <- treasury_result$portfolio$Portfolio_Duration
+
+duration_long <- duration_data %>%
+  pivot_longer(cols = -Date,
+               names_to = "Portfolio",
+               values_to = "Duration")
+
+duration_comparison_plot <- ggplot(duration_long %>% filter(!is.na(Duration)),
+                                   aes(x = Date, y = Duration, color = Portfolio)) +
+  geom_line(size = 1.2) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red", size = 1) +
+  geom_ribbon(aes(ymin = 9, ymax = 11),
+              alpha = 0.1, fill = "red", color = NA) +
+  scale_color_manual(values = color_palette) +
+  labs(x = "Date",
+       y = "Duration (Years)",
+       color = "Portfolio") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+
+print(duration_comparison_plot)
+```
+
+# ============================================================================
+# HELPER FUNCTIONS FOR PERFORMANCE METRICS
+# ============================================================================
+```{r}
+
+
+# Function to calculate daily returns
+calc_daily_returns <- function(values) {
+  returns <- diff(values) / head(values, -1)
+  return(returns)
+}
+
+# Function to calculate maximum drawdown
+calc_max_drawdown <- function(values) {
+  cummax_values <- cummax(values)
+  drawdowns <- (values - cummax_values) / cummax_values
+  max_drawdown <- min(drawdowns, na.rm = TRUE) * 100  # as percentage
+  return(max_drawdown)
+}
+
+# Function to calculate all performance metrics for a given period
+calc_performance_metrics <- function(values, dates, r_f_annual) {
+  
+  # Risk-free rate (daily)
+  rf_rate_daily <- (1 + r_f_annual)^(1/252) - 1
+  
+  # Calculate returns
+  initial_value <- values[1]
+  final_value <- tail(values, 1)
+  total_return_pct <- (final_value - initial_value) / initial_value * 100
+  
+  # Daily returns
+  daily_returns <- calc_daily_returns(values)
+  
+  # Excess returns
+  excess_returns <- daily_returns - rf_rate_daily
+  
+  # Sharpe Ratio
+  mean_excess <- mean(excess_returns, na.rm = TRUE)
+  sd_returns <- sd(daily_returns, na.rm = TRUE)
+  sharpe_ratio <- mean_excess / sd_returns * sqrt(252)
+  
+  # Sortino Ratio (only downside deviation)
+  downside_returns <- excess_returns[excess_returns < 0]
+  if (length(downside_returns) > 0) {
+    downside_deviation <- sd(downside_returns, na.rm = TRUE)
+    sortino_ratio <- mean_excess / downside_deviation * sqrt(252)
+  } else {
+    sortino_ratio <- NA
+  }
+  
+  # Maximum Drawdown
+  max_dd <- calc_max_drawdown(values)
+  
+  # Annualized Volatility
+  ann_vol <- sd_returns * sqrt(252) * 100
+  
+  return(list(
+    Initial_Value = initial_value,
+    Final_Value = final_value,
+    Total_Return_Pct = total_return_pct,
+    Sharpe_Ratio = sharpe_ratio,
+    Sortino_Ratio = sortino_ratio,
+    Max_Drawdown_Pct = max_dd,
+    Ann_Volatility = ann_vol
+  ))
+}
+```
+
+
+# ============================================================================
+# OVERALL PERFORMANCE METRICS
+# ============================================================================
+```{r}
+cat("\n", rep("=", 80), "\n")
+cat("CALCULATING OVERALL PERFORMANCE METRICS (2020-2024)\n")
+cat(rep("=", 80), "\n\n")
+
+all_portfolios <- c(names(all_results), "Treasury")
+
+performance_metrics_overall <- data.frame(
+  Portfolio = character(),
+  Initial_Value = numeric(),
+  Final_Value = numeric(),
+  Total_Return_Pct = numeric(),
+  Sharpe_Ratio = numeric(),
+  Sortino_Ratio = numeric(),
+  Max_Drawdown_Pct = numeric(),
+  Ann_Volatility = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (portfolio_name in all_portfolios) {
+  
+  # Get portfolio values
+  if (portfolio_name == "Treasury") {
+    values <- treasury_result$portfolio$Portfolio_Value
+    dates <- treasury_result$portfolio$Date
+  } else {
+    values <- all_results[[portfolio_name]]$portfolio$Portfolio_Value
+    dates <- all_results[[portfolio_name]]$portfolio$Date
+  }
+  
+  # Calculate metrics
+  metrics <- calc_performance_metrics(values, dates, r_f_annual_param)
+  
+  # Add to dataframe
+  performance_metrics_overall <- rbind(performance_metrics_overall, 
+                                       data.frame(
+                                         Portfolio = portfolio_name,
+                                         Initial_Value = metrics$Initial_Value,
+                                         Final_Value = metrics$Final_Value,
+                                         Total_Return_Pct = metrics$Total_Return_Pct,
+                                         Sharpe_Ratio = metrics$Sharpe_Ratio,
+                                         Sortino_Ratio = metrics$Sortino_Ratio,
+                                         Max_Drawdown_Pct = metrics$Max_Drawdown_Pct,
+                                         Ann_Volatility = metrics$Ann_Volatility
+                                       ))
+}
+
+cat("=== Overall Performance Metrics ===\n\n")
+print(performance_metrics_overall)
+cat("\n")
+
+```
+
+# ============================================================================
+# YEARLY PERFORMANCE METRICS
+# ============================================================================
+```{r}
+cat("\n", rep("=", 80), "\n")
+cat("CALCULATING YEARLY PERFORMANCE METRICS\n")
+cat(rep("=", 80), "\n\n")
+
+years <- sort(unique(comparison_df$Year))
+performance_metrics_yearly <- list()
+
+for (yr in years) {
+  
+  yearly_metrics <- data.frame(
+    Portfolio = character(),
+    Year = integer(),
+    Initial_Value = numeric(),
+    Final_Value = numeric(),
+    Total_Return_Pct = numeric(),
+    Sharpe_Ratio = numeric(),
+    Sortino_Ratio = numeric(),
+    Max_Drawdown_Pct = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (portfolio_name in all_portfolios) {
+    
+    # Get portfolio values for this year
+    if (portfolio_name == "Treasury") {
+      year_data <- treasury_result$portfolio %>%
+        filter(year(Date) == yr)
+      values <- year_data$Portfolio_Value
+      dates <- year_data$Date
+    } else {
+      year_data <- all_results[[portfolio_name]]$portfolio %>%
+        filter(year(Date) == yr)
+      values <- year_data$Portfolio_Value
+      dates <- year_data$Date
+    }
+    
+    # Skip if no data for this year
+    if (length(values) == 0) next
+    
+    # Calculate metrics
+    metrics <- calc_performance_metrics(values, dates, r_f_annual_param)
+    
+    # Add to dataframe
+    yearly_metrics <- rbind(yearly_metrics, 
+                            data.frame(
+                              Portfolio = portfolio_name,
+                              Year = yr,
+                              Initial_Value = metrics$Initial_Value,
+                              Final_Value = metrics$Final_Value,
+                              Total_Return_Pct = metrics$Total_Return_Pct,
+                              Sharpe_Ratio = metrics$Sharpe_Ratio,
+                              Sortino_Ratio = metrics$Sortino_Ratio,
+                              Max_Drawdown_Pct = metrics$Max_Drawdown_Pct
+                            ))
+  }
+  
+  performance_metrics_yearly[[as.character(yr)]] <- yearly_metrics
+  
+  cat("=== Year", yr, "===\n")
+  print(yearly_metrics)
+  cat("\n")
+}
+
+# ============================================================================
+# PLOT 4: DAILY RETURNS DISTRIBUTION COMPARISON (SEPARATE PANELS)
+# ============================================================================
+
+cat("=== Generating Returns Distribution Plot (Separate Panels) ===\n\n")
+
+returns_data <- data.frame()
+
+for (portfolio_name in all_portfolios) {
+  
+  # Get portfolio values
+  if (portfolio_name == "Treasury") {
+    portfolio_df <- treasury_result$portfolio %>%
+      mutate(Year = year(Date))
+  } else {
+    portfolio_df <- all_results[[portfolio_name]]$portfolio %>%
+      mutate(Year = year(Date))
+  }
+  
+  # Calculate daily returns
+  daily_returns <- calc_daily_returns(portfolio_df$Portfolio_Value) * 100  # as percentage
+  
+  returns_df <- data.frame(
+    Portfolio = portfolio_name,
+    Daily_Return = daily_returns
+  )
+  
+  returns_data <- rbind(returns_data, returns_df)
+}
+
+returns_dist_plot <- ggplot(returns_data %>% filter(!is.na(Daily_Return)), 
+                           aes(x = Daily_Return, fill = Portfolio)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+  scale_fill_manual(values = color_palette) +
+  facet_wrap(~ Portfolio, nrow = 1, scales = "free_y") +
+  labs(title = "Overall Daily Returns Distribution Comparison (2020-2024)",
+       subtitle = "Separate panels for each portfolio",
+       x = "Daily Return (%)",
+       y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold"))
+
+print(returns_dist_plot)
+
+# ============================================================================
+# PLOT 6: YEARLY DENSITY CHARTS FOR RETURNS (GRID LAYOUT)
+# ============================================================================
+
+cat("\n=== Generating Yearly Density Charts (Grid Layout) ===\n\n")
+
+# Collect all yearly returns data
+all_yearly_returns_data <- data.frame()
+
+for (yr in years) {
+  
+  for (portfolio_name in all_portfolios) {
+    
+    # Get portfolio values for this year
+    if (portfolio_name == "Treasury") {
+      year_portfolio <- treasury_result$portfolio %>%
+        filter(year(Date) == yr)
+    } else {
+      year_portfolio <- all_results[[portfolio_name]]$portfolio %>%
+        filter(year(Date) == yr)
+    }
+    
+    # Calculate daily returns for this year
+    if (nrow(year_portfolio) > 1) {
+      year_daily_returns <- calc_daily_returns(year_portfolio$Portfolio_Value) * 100  # as percentage
+      
+      year_returns_df <- data.frame(
+        Portfolio = portfolio_name,
+        Daily_Return = year_daily_returns,
+        Year = yr
+      )
+      
+      all_yearly_returns_data <- rbind(all_yearly_returns_data, year_returns_df)
+    }
+  }
+}
+
+# Create grid plot with years as columns and portfolios as rows
+yearly_density_grid_plot <- ggplot(all_yearly_returns_data %>% filter(!is.na(Daily_Return)), 
+                                    aes(x = Daily_Return, fill = Portfolio)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+  scale_fill_manual(values = color_palette) +
+  facet_grid(Portfolio ~ Year, scales = "free_y") +
+  labs(title = "Daily Returns Distribution by Year and Portfolio",
+       subtitle = "Grid Layout: Rows = Portfolios, Columns = Years",
+       x = "Daily Return (%)",
+       y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold"))
+
+print(yearly_density_grid_plot)
+
+cat("\n")
+
+
+```
+
+
+# ============================================================================
+# box plots - all duration-based portfolios (Groups) + treasury (Fig 11)
+# ============================================================================
+
+```{r}
+# Prepare data for box plots - all duration-based portfolios + treasury
+box_data_all <- data.frame()
+
+# Get list of duration-based portfolio groups
+duration_portfolios <- names(all_results)
+
+# Add all duration-based portfolios
+for (i in seq_along(duration_portfolios)) {
+  group_port <- duration_portfolios[i]
+  
+  portfolio_data <- all_results[[group_port]]$portfolio %>%
+    mutate(Year = year(Date))
+  
+  # Yearly data
+  for (yr in years) {
+    year_data <- portfolio_data %>% filter(Year == yr)
+    if (nrow(year_data) > 1) {
+      daily_returns <- calc_daily_returns(year_data$Portfolio_Value)
+      box_data_all <- rbind(box_data_all, data.frame(
+        Portfolio = group_port,
+        Year = as.character(yr),
+        Daily_Return = daily_returns,
+        Portfolio_Order = i
+      ))
+    }
+  }
+  
+  # Overall data
+  daily_returns_overall <- calc_daily_returns(portfolio_data$Portfolio_Value)
+  box_data_all <- rbind(box_data_all, data.frame(
+    Portfolio = group_port,
+    Year = "Overall",
+    Daily_Return = daily_returns_overall,
+    Portfolio_Order = i
+  ))
+}
+
+# Add Treasury
+treasury_data_year <- treasury_result$portfolio %>%
+  mutate(Year = year(Date))
+
+for (yr in years) {
+  year_data <- treasury_data_year %>% filter(Year == yr)
+  if (nrow(year_data) > 1) {
+    daily_returns <- calc_daily_returns(year_data$Portfolio_Value)
+    box_data_all <- rbind(box_data_all, data.frame(
+      Portfolio = "Treasury",
+      Year = as.character(yr),
+      Daily_Return = daily_returns,
+      Portfolio_Order = length(duration_portfolios) + 1
+    ))
+  }
+}
+
+# Overall Treasury
+daily_returns_treasury_overall <- calc_daily_returns(treasury_result$portfolio$Portfolio_Value)
+box_data_all <- rbind(box_data_all, data.frame(
+  Portfolio = "Treasury",
+  Year = "Overall",
+  Daily_Return = daily_returns_treasury_overall,
+  Portfolio_Order = length(duration_portfolios) + 1
+))
+
+# Create color palette
+n_duration_groups <- length(duration_portfolios)
+color_palette <- c(
+  colorRampPalette(c("darkgreen", "limegreen"))(n_duration_groups),
+  "navy"
+)
+
+# Set portfolio factor levels for consistent ordering
+portfolio_levels <- c(duration_portfolios, "Treasury")
+box_data_all$Portfolio <- factor(box_data_all$Portfolio, levels = portfolio_levels)
+
+# Set Year factor levels to control facet order
+year_levels <- c(as.character(years), "Overall")
+box_data_all$Year <- factor(box_data_all$Year, levels = year_levels)
+
+# Calculate consistent y-axis limits
+y_range <- range(box_data_all$Daily_Return, na.rm = TRUE)
+y_padding <- diff(y_range) * 0.05
+y_limits <- c(y_range[1] - y_padding, y_range[2] + y_padding)
+
+# Create combined plot with facets
+p_combined <- ggplot(box_data_all, aes(x = Portfolio, y = Daily_Return, fill = Portfolio)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3, width = 0.6) +
+  facet_wrap(~ Year, nrow = 1) +
+  scale_fill_manual(values = color_palette) +
+  coord_cartesian(ylim = y_limits) +
+  labs(
+    #title = "Daily Return Distribution (Yearly + Overall): Duration-Based Portfolios vs Treasury",
+    x = "Portfolio",
+    y = "Daily Return (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title = element_text(size = 11, face = "bold"),
+    strip.text = element_text(face = "bold", size = 10),
+    # Frame around entire plot
+    plot.background = element_rect(color = "black", fill = NA, linewidth = 1),
+    # Frame around each panel
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(0.5, "lines")
+  )
+
+print(p_combined)
+
+```
+
+
+# ============================================================================
+# RISK-RETURN SCATTER PLOTS - DURATION-BASED PORTFOLIOS (Fig 12)
+# ============================================================================
+```{r}
+
+
+# Prepare scatter data for all years + overall
+scatter_data_all_years <- data.frame()
+
+# Get list of duration-based portfolio groups
+duration_portfolios <- names(all_results)
+
+# Color palette
+n_duration_groups <- length(duration_portfolios)
+color_palette <- c(
+  colorRampPalette(c("darkgreen", "limegreen"))(n_duration_groups),
+  "navy"
+)
+names(color_palette) <- c(duration_portfolios, "Treasury")
+
+# Risk-free rate (daily) - using 1% annual
+rf_rate_daily <- (1 + 0.01)^(1/252) - 1
+
+# Calculate metrics for each year
+for (yr in years) {
+  
+  # Duration-based portfolios
+  for (i in seq_along(duration_portfolios)) {
+    group_port <- duration_portfolios[i]
+    
+    portfolio_data <- all_results[[group_port]]$portfolio %>%
+      filter(year(Date) == yr)
+    
+    if (nrow(portfolio_data) > 1) {
+      daily_returns <- calc_daily_returns(portfolio_data$Portfolio_Value)
+      total_return <- (tail(portfolio_data$Portfolio_Value, 1) / 
+                      head(portfolio_data$Portfolio_Value, 1) - 1) * 100
+      volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252) * 100
+      
+      # Calculate Sharpe ratio
+      excess_returns <- daily_returns - rf_rate_daily
+      mean_excess <- mean(excess_returns, na.rm = TRUE)
+      sd_returns <- sd(daily_returns, na.rm = TRUE)
+      sharpe <- mean_excess / sd_returns * sqrt(252)
+      
+      scatter_data_all_years <- rbind(scatter_data_all_years, data.frame(
+        Portfolio = group_port,
+        Year = as.character(yr),
+        Return = total_return,
+        Volatility = volatility,
+        Sharpe = sharpe,
+        Portfolio_Order = i
+      ))
+    }
+  }
+  
+  # Treasury
+  treasury_data <- treasury_result$portfolio %>%
+    filter(year(Date) == yr)
+  
+  if (nrow(treasury_data) > 1) {
+    daily_returns <- calc_daily_returns(treasury_data$Portfolio_Value)
+    total_return <- (tail(treasury_data$Portfolio_Value, 1) / 
+                    head(treasury_data$Portfolio_Value, 1) - 1) * 100
+    volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252) * 100
+    
+    # Calculate Sharpe ratio
+    excess_returns <- daily_returns - rf_rate_daily
+    mean_excess <- mean(excess_returns, na.rm = TRUE)
+    sd_returns <- sd(daily_returns, na.rm = TRUE)
+    sharpe <- mean_excess / sd_returns * sqrt(252)
+    
+    scatter_data_all_years <- rbind(scatter_data_all_years, data.frame(
+      Portfolio = "Treasury",
+      Year = as.character(yr),
+      Return = total_return,
+      Volatility = volatility,
+      Sharpe = sharpe,
+      Portfolio_Order = length(duration_portfolios) + 1
+    ))
+  }
+}
+
+# Calculate metrics for overall period
+for (i in seq_along(duration_portfolios)) {
+  group_port <- duration_portfolios[i]
+  
+  portfolio_data <- all_results[[group_port]]$portfolio
+  daily_returns <- calc_daily_returns(portfolio_data$Portfolio_Value)
+  total_return <- (tail(portfolio_data$Portfolio_Value, 1) / 
+                  head(portfolio_data$Portfolio_Value, 1) - 1) * 100
+  volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252) * 100
+  
+  # Calculate Sharpe ratio
+  excess_returns <- daily_returns - rf_rate_daily
+  mean_excess <- mean(excess_returns, na.rm = TRUE)
+  sd_returns <- sd(daily_returns, na.rm = TRUE)
+  sharpe <- mean_excess / sd_returns * sqrt(252)
+  
+  scatter_data_all_years <- rbind(scatter_data_all_years, data.frame(
+    Portfolio = group_port,
+    Year = "Overall",
+    Return = total_return,
+    Volatility = volatility,
+    Sharpe = sharpe,
+    Portfolio_Order = i
+  ))
+}
+
+# Overall Treasury
+daily_returns <- calc_daily_returns(treasury_result$portfolio$Portfolio_Value)
+total_return <- (tail(treasury_result$portfolio$Portfolio_Value, 1) / 
+                head(treasury_result$portfolio$Portfolio_Value, 1) - 1) * 100
+volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252) * 100
+
+# Calculate Sharpe ratio
+excess_returns <- daily_returns - rf_rate_daily
+mean_excess <- mean(excess_returns, na.rm = TRUE)
+sd_returns <- sd(daily_returns, na.rm = TRUE)
+sharpe <- mean_excess / sd_returns * sqrt(252)
+
+scatter_data_all_years <- rbind(scatter_data_all_years, data.frame(
+  Portfolio = "Treasury",
+  Year = "Overall",
+  Return = total_return,
+  Volatility = volatility,
+  Sharpe = sharpe,
+  Portfolio_Order = length(duration_portfolios) + 1
+))
+
+# Calculate consistent axis limits
+vol_range <- range(scatter_data_all_years$Volatility, na.rm = TRUE)
+ret_range <- range(scatter_data_all_years$Return, na.rm = TRUE)
+vol_padding <- diff(vol_range) * 0.1
+ret_padding <- diff(ret_range) * 0.1
+vol_limits <- c(vol_range[1] - vol_padding, vol_range[2] + vol_padding)
+ret_limits <- c(ret_range[1] - ret_padding, ret_range[2] + ret_padding)
+
+cat("\n=== Consistent axis limits ===")
+cat("\nVolatility:", round(vol_limits[1], 2), "to", round(vol_limits[2], 2))
+cat("\nReturn:", round(ret_limits[1], 2), "to", round(ret_limits[2], 2), "\n\n")
+
+# Create plots for each year
+for (yr in years) {
+  
+  cat("--- Risk-return scatter for year:", yr, "---\n")
+  
+  yearly_data <- scatter_data_all_years %>% 
+    filter(Year == as.character(yr)) %>%
+    mutate(Portfolio = factor(Portfolio, levels = c(duration_portfolios, "Treasury")))
+  
+  p_year <- ggplot(yearly_data, aes(x = Volatility, y = Return, 
+                                     color = Portfolio, size = Sharpe)) +
+    geom_point(alpha = 0.8) +
+    geom_label_repel(
+      aes(label = Portfolio), 
+      size = 3.5,
+      box.padding = 0.8,
+      point.padding = 0.5,
+      segment.color = "grey50",
+      segment.size = 0.3,
+      max.overlaps = 20,
+      show.legend = FALSE,
+      force = 2,
+      min.segment.length = 0,
+      fill = alpha("white", 0.9),
+      label.padding = unit(0.25, "lines")
+    ) +
+    scale_color_manual(
+      values = color_palette,
+      name = "Portfolio"
+    ) +
+    scale_size_continuous(
+      range = c(3, 12), 
+      name = "Sharpe Ratio"
+    ) +
+    coord_cartesian(xlim = vol_limits, ylim = ret_limits) +
+    labs(
+      #title = paste( yr),
+      #subtitle = "Point size represents Sharpe ratio | Duration-Based Portfolios",
+      x = "Volatility (Annualized %)",
+      y = "Total Return (%)"
+    ) +
+    guides(
+      color = guide_legend(
+        title.position = "top",
+        title.hjust = 0.5,
+        nrow = 2,
+        override.aes = list(size = 4, alpha = 0.9)
+      ),
+      size = guide_legend(
+        title.position = "top",
+        title.hjust = 0.5,
+        nrow = 3,
+        override.aes = list(alpha = 0.8)
+      )
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5),
+      legend.position = "right",
+      legend.box = "vertical",
+      legend.spacing = unit(0.2, "cm"),
+      legend.title = element_text(size = 9, face = "bold"),
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.3, "cm"),
+      legend.key.height = unit(0.3, "cm"),
+      legend.key.width = unit(0.3, "cm"),
+      legend.margin = margin(t = 0, r = 3, b = 0, l = 3),
+      legend.box.spacing = unit(0.1, "cm"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(p_year)
+}
+
+# Create plot for overall period
+cat("--- Risk-return scatter for Overall period ---\n")
+
+overall_data <- scatter_data_all_years %>% 
+  filter(Year == "Overall") %>%
+  mutate(Portfolio = factor(Portfolio, levels = c(duration_portfolios, "Treasury")))
+
+p_overall <- ggplot(overall_data, aes(x = Volatility, y = Return, 
+                                       color = Portfolio, size = Sharpe)) +
+  geom_point(alpha = 0.8) +
+  geom_label_repel(
+    aes(label = Portfolio), 
+    size = 3.5,
+    box.padding = 0.8,
+    point.padding = 0.5,
+    segment.color = "grey50",
+    segment.size = 0.3,
+    max.overlaps = 20,
+    show.legend = FALSE,
+    force = 2,
+    min.segment.length = 0,
+    fill = alpha("white", 0.9),
+    label.padding = unit(0.25, "lines")
+  ) +
+  scale_color_manual(
+    values = color_palette,
+    name = "Portfolio"
+  ) +
+  scale_size_continuous(
+    range = c(3, 12), 
+    name = "Sharpe Ratio"
+  ) +
+  coord_cartesian(xlim = vol_limits, ylim = ret_limits) +
+  labs(
+    #title = "Risk-Return Profile: Overall Period (2020-2024)",
+    #subtitle = "Point size represents Sharpe ratio | Duration-Based Portfolios",
+    x = "Volatility (Annualized %)",
+    y = "Total Return (%)"
+  ) +
+  guides(
+    color = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      nrow = 2,
+      override.aes = list(size = 4, alpha = 0.9)
+    ),
+    size = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      nrow = 3,
+      override.aes = list(alpha = 0.8)
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.spacing = unit(0.2, "cm"),
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.3, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.key.width = unit(0.3, "cm"),
+    legend.margin = margin(t = 0, r = 3, b = 0, l = 3),
+    legend.box.spacing = unit(0.1, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_overall)
+```
+
+# ============================================================================
+# DETAILED COMPARISON TABLES BY YEAR
+# ============================================================================
+```{r}
+cat("\n", rep("=", 80), "\n")
+cat("DETAILED PERFORMANCE COMPARISON TABLES BY YEAR\n")
+cat(rep("=", 80), "\n\n")
+
+for (yr in years) {
+  
+  cat("\n=== YEAR ", yr, " - DETAILED COMPARISON ===\n\n", sep = "")
+  
+  yearly_data <- performance_metrics_yearly[[as.character(yr)]]
+  
+  if (!is.null(yearly_data) && nrow(yearly_data) > 0) {
+    
+    # Create comparison table
+    comparison_table_year <- yearly_data %>%
+      dpylr::select(Portfolio, Initial_Value, Final_Value, Total_Return_Pct, 
+             Sharpe_Ratio, Sortino_Ratio, Max_Drawdown_Pct) %>%
+      arrange(desc(Total_Return_Pct))
+    
+    # Round values for display (3 decimal places)
+    comparison_table_year$Initial_Value <- round(comparison_table_year$Initial_Value, 3)
+    comparison_table_year$Final_Value <- round(comparison_table_year$Final_Value, 3)
+    comparison_table_year$Total_Return_Pct <- round(comparison_table_year$Total_Return_Pct, 3)
+    comparison_table_year$Sharpe_Ratio <- round(comparison_table_year$Sharpe_Ratio, 3)
+    comparison_table_year$Sortino_Ratio <- round(comparison_table_year$Sortino_Ratio, 3)
+    comparison_table_year$Max_Drawdown_Pct <- round(comparison_table_year$Max_Drawdown_Pct, 3)
+    
+    print(comparison_table_year)
+    
+    # Calculate statistics
+    cat("\n--- Year ", yr, " Summary Statistics ---\n", sep = "")
+    cat("Best Return: ", comparison_table_year$Portfolio[1], " (", 
+        comparison_table_year$Total_Return_Pct[1], "%)\n", sep = "")
+    
+    best_sharpe_idx <- which.max(comparison_table_year$Sharpe_Ratio)
+    cat("Best Sharpe: ", comparison_table_year$Portfolio[best_sharpe_idx], " (", 
+        comparison_table_year$Sharpe_Ratio[best_sharpe_idx], ")\n", sep = "")
+    
+    best_dd_idx <- which.max(comparison_table_year$Max_Drawdown_Pct)
+    cat("Lowest Drawdown: ", comparison_table_year$Portfolio[best_dd_idx], " (", 
+        comparison_table_year$Max_Drawdown_Pct[best_dd_idx], "%)\n", sep = "")
+    
+    cat("\n")
+  }
+}
+
+# ============================================================================
+# OVERALL COMPARISON TABLE (FORMATTED)
+# ============================================================================
+
+cat("\n", rep("=", 80), "\n")
+cat("OVERALL PERFORMANCE COMPARISON TABLE (2020-2024)\n")
+cat(rep("=", 80), "\n\n")
+
+comparison_table_overall <- performance_metrics_overall %>%
+  arrange(desc(Total_Return_Pct))
+
+# Round for display (3 decimals)
+comparison_table_overall_display <- comparison_table_overall
+comparison_table_overall_display$Initial_Value <- round(comparison_table_overall_display$Initial_Value, 3)
+comparison_table_overall_display$Final_Value <- round(comparison_table_overall_display$Final_Value, 3)
+comparison_table_overall_display$Total_Return_Pct <- round(comparison_table_overall_display$Total_Return_Pct, 3)
+comparison_table_overall_display$Sharpe_Ratio <- round(comparison_table_overall_display$Sharpe_Ratio, 3)
+comparison_table_overall_display$Sortino_Ratio <- round(comparison_table_overall_display$Sortino_Ratio, 3)
+comparison_table_overall_display$Max_Drawdown_Pct <- round(comparison_table_overall_display$Max_Drawdown_Pct, 3)
+comparison_table_overall_display$Ann_Volatility <- round(comparison_table_overall_display$Ann_Volatility, 3)
+
+print(comparison_table_overall_display)
+
+cat("\n")
+
+# ============================================================================
+# LATEX TABLE GENERATION (3 DECIMALS)
+# ============================================================================
+
+cat("\n", rep("=", 80), "\n")
+cat("GENERATING LATEX TABLE FOR OVERLEAF\n")
+cat(rep("=", 80), "\n\n")
+
+# Create LaTeX table structure
+latex_table <- data.frame(Portfolio = all_portfolios)
+
+# Add columns for each year - Returns
+for (yr in years) {
+  yearly_data <- performance_metrics_yearly[[as.character(yr)]]
+  col_name <- paste0("Return_", yr)
+  latex_table[[col_name]] <- sapply(all_portfolios, function(p) {
+    idx <- which(yearly_data$Portfolio == p)
+    if (length(idx) > 0) yearly_data$Total_Return_Pct[idx] else NA
+  })
+}
+
+# Add columns for each year - Sharpe
+for (yr in years) {
+  yearly_data <- performance_metrics_yearly[[as.character(yr)]]
+  col_name <- paste0("Sharpe_", yr)
+  latex_table[[col_name]] <- sapply(all_portfolios, function(p) {
+    idx <- which(yearly_data$Portfolio == p)
+    if (length(idx) > 0) yearly_data$Sharpe_Ratio[idx] else NA
+  })
+}
+
+# Add columns for each year - Sortino
+for (yr in years) {
+  yearly_data <- performance_metrics_yearly[[as.character(yr)]]
+  col_name <- paste0("Sortino_", yr)
+  latex_table[[col_name]] <- sapply(all_portfolios, function(p) {
+    idx <- which(yearly_data$Portfolio == p)
+    if (length(idx) > 0) yearly_data$Sortino_Ratio[idx] else NA
+  })
+}
+
+# Add columns for each year - Max Drawdown
+for (yr in years) {
+  yearly_data <- performance_metrics_yearly[[as.character(yr)]]
+  col_name <- paste0("MaxDD_", yr)
+  latex_table[[col_name]] <- sapply(all_portfolios, function(p) {
+    idx <- which(yearly_data$Portfolio == p)
+    if (length(idx) > 0) yearly_data$Max_Drawdown_Pct[idx] else NA
+  })
+}
+
+# Add overall columns
+latex_table$Return_Overall <- sapply(all_portfolios, function(p) {
+  idx <- which(performance_metrics_overall$Portfolio == p)
+  performance_metrics_overall$Total_Return_Pct[idx]
+})
+
+latex_table$Sharpe_Overall <- sapply(all_portfolios, function(p) {
+  idx <- which(performance_metrics_overall$Portfolio == p)
+  performance_metrics_overall$Sharpe_Ratio[idx]
+})
+
+latex_table$Sortino_Overall <- sapply(all_portfolios, function(p) {
+  idx <- which(performance_metrics_overall$Portfolio == p)
+  performance_metrics_overall$Sortino_Ratio[idx]
+})
+
+latex_table$MaxDD_Overall <- sapply(all_portfolios, function(p) {
+  idx <- which(performance_metrics_overall$Portfolio == p)
+  performance_metrics_overall$Max_Drawdown_Pct[idx]
+})
+
+# Generate LaTeX table with 3 decimal places
+cat("\\begin{table}[htbp]\n")
+cat("\\centering\n")
+cat("\\caption{Portfolio Performance Metrics by Year and Overall (2020--2024)}\n")
+cat("\\label{tab:performance_duration_based}\n")
+cat("\\resizebox{\\textwidth}{!}{\n")
+cat("\\begin{tabular}{l", paste(rep("r", ncol(latex_table) - 1), collapse = ""), "}\n")
+cat("\\hline\\hline\n")
+
+# Header rows
+header1 <- "Portfolio"
+for (yr in years) {
+  header1 <- paste0(header1, " & \\multicolumn{4}{c}{", yr, "}")
+}
+header1 <- paste0(header1, " & \\multicolumn{4}{c}{Overall} \\\\\n")
+cat(header1)
+
+header2 <- " "
+for (yr in c(years, "Overall")) {
+  header2 <- paste0(header2, " & Return & Sharpe & Sortino & Max DD")
+}
+header2 <- paste0(header2, " \\\\\n")
+cat(header2)
+
+header3 <- " "
+for (yr in c(years, "Overall")) {
+  header3 <- paste0(header3, " & (\\%) & & & (\\%)")
+}
+header3 <- paste0(header3, " \\\\\n")
+cat(header3)
+
+cat("\\hline\n")
+
+# Data rows (3 decimals)
+for (i in 1:nrow(latex_table)) {
+  row_str <- latex_table$Portfolio[i]
+  
+  for (yr in years) {
+    ret <- sprintf("%.3f", latex_table[[paste0("Return_", yr)]][i])
+    sha <- sprintf("%.3f", latex_table[[paste0("Sharpe_", yr)]][i])
+    sor <- sprintf("%.3f", latex_table[[paste0("Sortino_", yr)]][i])
+    mdd <- sprintf("%.3f", latex_table[[paste0("MaxDD_", yr)]][i])
+    row_str <- paste0(row_str, " & ", ret, " & ", sha, " & ", sor, " & ", mdd)
+  }
+  
+  # Overall
+  ret_ov <- sprintf("%.3f", latex_table$Return_Overall[i])
+  sha_ov <- sprintf("%.3f", latex_table$Sharpe_Overall[i])
+  sor_ov <- sprintf("%.3f", latex_table$Sortino_Overall[i])
+  mdd_ov <- sprintf("%.3f", latex_table$MaxDD_Overall[i])
+  row_str <- paste0(row_str, " & ", ret_ov, " & ", sha_ov, " & ", sor_ov, " & ", mdd_ov)
+  
+  cat(row_str, " \\\\\n")
+}
+
+cat("\\hline\\hline\n")
+cat("\\end{tabular}\n")
+cat("}\n")
+cat("\\end{table}\n\n")
+
+# ============================================================================
+# SUMMARY STATISTICS
+# ============================================================================
+
+cat("\n", rep("=", 80), "\n")
+cat("SUMMARY: BEST PERFORMING PORTFOLIOS\n")
+cat(rep("=", 80), "\n\n")
+
+# Best by Total Return
+best_return_idx <- which.max(performance_metrics_overall$Total_Return_Pct)
+cat("Highest Total Return:\n")
+cat("  Portfolio:", performance_metrics_overall$Portfolio[best_return_idx], "\n")
+cat("  Return:", round(performance_metrics_overall$Total_Return_Pct[best_return_idx], 3), "%\n\n")
+
+# Best by Sharpe Ratio
+best_sharpe_idx <- which.max(performance_metrics_overall$Sharpe_Ratio)
+cat("Highest Sharpe Ratio:\n")
+cat("  Portfolio:", performance_metrics_overall$Portfolio[best_sharpe_idx], "\n")
+cat("  Sharpe:", round(performance_metrics_overall$Sharpe_Ratio[best_sharpe_idx], 3), "\n\n")
+
+# Lowest Max Drawdown (least negative)
+best_dd_idx <- which.max(performance_metrics_overall$Max_Drawdown_Pct)
+cat("Lowest Max Drawdown:\n")
+cat("  Portfolio:", performance_metrics_overall$Portfolio[best_dd_idx], "\n")
+cat("  Max DD:", round(performance_metrics_overall$Max_Drawdown_Pct[best_dd_idx], 3), "%\n\n")
+
+# Lowest Volatility
+best_vol_idx <- which.min(performance_metrics_overall$Ann_Volatility)
+cat("Lowest Volatility:\n")
+cat("  Portfolio:", performance_metrics_overall$Portfolio[best_vol_idx], "\n")
+cat("  Ann. Vol:", round(performance_metrics_overall$Ann_Volatility[best_vol_idx], 3), "%\n\n")
+
+cat(rep("=", 80), "\n")
+cat("MULTI-PORTFOLIO COMPARISON COMPLETE\n")
+cat(rep("=", 80), "\n\n")
+
+# ============================================================================
+# STORE RESULTS
+# ============================================================================
+
+comparison_results <- list(
+  performance_overall = performance_metrics_overall,
+  performance_yearly = performance_metrics_yearly,
+  comparison_table_overall = comparison_table_overall_display,
+  latex_table = latex_table,
+  all_portfolio_results = all_results,
+  treasury_result = treasury_result
+)
+
+cat("=== Results Stored ===\n")
+cat("comparison_results$performance_overall - Overall metrics table\n")
+cat("comparison_results$performance_yearly - Yearly metrics by portfolio\n")
+cat("comparison_results$latex_table - LaTeX table for publication\n")
+cat("comparison_results$all_portfolio_results - Individual portfolio results\n")
+cat("comparison_results$treasury_result - Treasury portfolio result\n")
+
+
+
+
+
+```
+
+
+# ============================================================================
+# HYBRID PORTFOLIOS: CONVEX COMBINATIONS OF GREEN + TREASURY
+# ============================================================================
+```{r}
+cat("\n\n", rep("=", 100), "\n")
+cat("HYBRID PORTFOLIO CONSTRUCTION\n")
+cat(rep("=", 100), "\n\n")
+
+# Define hybrid weights (green bond weight, treasury weight)
+hybrid_weights <- list(
+  "Hybrid_25_75" = c(green = 0.25, treasury = 0.75),
+  "Hybrid_50_50" = c(green = 0.50, treasury = 0.50),
+  "Hybrid_75_25" = c(green = 0.75, treasury = 0.25)
+)
+
+# Get list of green portfolios (exclude Treasury)
+green_portfolios <- names(all_results)
+
+# Store all hybrid results
+all_hybrid_results <- list()
+
+# Create hybrid portfolios for each green portfolio
+for (green_port in green_portfolios) {
+  
+  cat("\n--- Creating hybrids for:", green_port, "---\n")
+  
+  # Get green portfolio data
+  green_data <- all_results[[green_port]]$portfolio %>%
+    dplyr::select(Date, Green_Value = Portfolio_Value)
+  
+  # Get treasury portfolio data
+  treasury_data <- treasury_result$portfolio %>%
+    dplyr::select(Date, Treasury_Value = Portfolio_Value)
+  
+  # Merge the two portfolios
+  merged_data <- inner_join(green_data, treasury_data, by = "Date")
+  
+  # Create each hybrid combination
+  for (hybrid_name in names(hybrid_weights)) {
+    
+    w_green <- hybrid_weights[[hybrid_name]]["green"]
+    w_treasury <- hybrid_weights[[hybrid_name]]["treasury"]
+    
+    # Calculate hybrid portfolio value as convex combination
+    hybrid_portfolio <- merged_data %>%
+      mutate(
+        Portfolio_Value = w_green * Green_Value + w_treasury * Treasury_Value,
+        Portfolio = paste0(green_port, "_", hybrid_name)
+      ) %>%
+      dplyr::select(Date, Portfolio_Value, Portfolio)
+    
+    # Store results
+    full_hybrid_name <- paste0(green_port, "_", hybrid_name)
+    all_hybrid_results[[full_hybrid_name]] <- list(
+      portfolio = hybrid_portfolio,
+      weight_green = w_green,
+      weight_treasury = w_treasury,
+      base_green = green_port
+    )
+    
+    cat("  Created:", full_hybrid_name, 
+        sprintf("(%.0f%% green + %.0f%% treasury)\n", 
+                w_green*100, w_treasury*100))
+  }
+}
+
+cat("\nTotal hybrid portfolios created:", length(all_hybrid_results), "\n")
+```
+
+# ============================================================================
+# CUMULATIVE RETURN PLOTS FOR HYBRID PORTFOLIOS (Fig 13)
+# ============================================================================
+```{r}
+
+
+# Calculate consistent scales
+all_hybrid_data <- data.frame()
+
+# Get list of duration-based portfolios
+duration_portfolios <- names(all_results)
+
+for (group_port in duration_portfolios) {
+  group_data <- all_results[[group_port]]$portfolio %>%
+    mutate(Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100)
+  all_hybrid_data <- rbind(all_hybrid_data, 
+                           data.frame(Cumulative_Return = group_data$Cumulative_Return))
+  
+  for (hybrid_name in names(hybrid_weights)) {
+    full_name <- paste0(group_port, "_", hybrid_name)
+    hybrid_data <- all_hybrid_results[[full_name]]$portfolio %>%
+      mutate(Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100)
+    all_hybrid_data <- rbind(all_hybrid_data, 
+                             data.frame(Cumulative_Return = hybrid_data$Cumulative_Return))
+  }
+}
+
+treasury_data <- treasury_result$portfolio %>%
+  mutate(Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100)
+all_hybrid_data <- rbind(all_hybrid_data, 
+                         data.frame(Cumulative_Return = treasury_data$Cumulative_Return))
+
+y_range <- range(all_hybrid_data$Cumulative_Return, na.rm = TRUE)
+y_padding <- diff(y_range) * 0.05
+y_limits <- c(y_range[1] - y_padding, y_range[2] + y_padding)
+
+cat("\n=== Y-axis limits:", round(y_limits[1], 2), "to", round(y_limits[2], 2), "===\n")
+
+# Create color gradient: navy (0%) to lightgreen (100%)
+color_gradient <- colorRampPalette(c("navy", "lightgreen"))(101)
+
+# Plot hybrids for each duration-based portfolio
+for (group_port in duration_portfolios) {
+  
+  cat("\n--- Plotting hybrids for:", group_port, "---\n")
+  
+  plot_data <- data.frame()
+  
+  # Add pure duration-based portfolio (100%)
+  group_data <- all_results[[group_port]]$portfolio %>%
+    mutate(
+      Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100,
+      Portfolio_Type = paste0(group_port, " (100%)"),
+      Group_Pct = 100
+    ) %>%
+    dplyr::select(Date, Cumulative_Return, Portfolio_Type, Group_Pct)
+  plot_data <- rbind(plot_data, group_data)
+  
+  # Add hybrid portfolios
+  for (hybrid_name in names(hybrid_weights)) {
+    full_name <- paste0(group_port, "_", hybrid_name)
+    w_group <- hybrid_weights[[hybrid_name]]["green"]  # Using same weight structure
+    
+    hybrid_data <- all_hybrid_results[[full_name]]$portfolio %>%
+      mutate(
+        Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100,
+        Portfolio_Type = sprintf("%s (%.0f%%)", group_port, w_group*100),
+        Group_Pct = w_group * 100
+      ) %>%
+      dplyr::select(Date, Cumulative_Return, Portfolio_Type, Group_Pct)
+    plot_data <- rbind(plot_data, hybrid_data)
+  }
+  
+  # Add pure Treasury (0%)
+  treasury_data <- treasury_result$portfolio %>%
+    mutate(
+      Cumulative_Return = (Portfolio_Value / Portfolio_Value[1] - 1) * 100,
+      Portfolio_Type = "Treasury (0%)",
+      Group_Pct = 0
+    ) %>%
+    dplyr::select(Date, Cumulative_Return, Portfolio_Type, Group_Pct)
+  plot_data <- rbind(plot_data, treasury_data)
+  
+  # Get unique portfolio types and assign colors based on group percentage
+  unique_portfolios <- plot_data %>%
+    dplyr::select(Portfolio_Type, Group_Pct) %>%
+    distinct() %>%
+    arrange(desc(Group_Pct))
+  
+  # Assign colors from gradient based on group percentage
+  portfolio_colors <- sapply(unique_portfolios$Group_Pct, function(pct) {
+    color_gradient[round(pct) + 1]  # +1 because index starts at 1
+  })
+  names(portfolio_colors) <- unique_portfolios$Portfolio_Type
+  
+  # Assign linetypes (Treasury dashed, others solid)
+  portfolio_linetypes <- ifelse(unique_portfolios$Group_Pct == 0, "dashed", "solid")
+  names(portfolio_linetypes) <- unique_portfolios$Portfolio_Type
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = Date, y = Cumulative_Return, 
+                              color = Portfolio_Type, linetype = Portfolio_Type)) +
+    geom_hline(yintercept = 0, color = "gray50", linetype = "dotted", size = 0.5) +
+    geom_line(size = 1.1) +
+    scale_color_manual(
+      values = portfolio_colors,
+      name = "Portfolio"
+    ) +
+    scale_linetype_manual(
+      values = portfolio_linetypes,
+      name = "Portfolio"
+    ) +
+    coord_cartesian(ylim = y_limits) +
+    scale_y_continuous(
+      breaks = seq(floor(y_limits[1]/5)*5, ceiling(y_limits[2]/5)*5, by = 5)
+    ) +
+    labs(
+      #title = paste("Duration-Based Portfolio:", group_port),
+      #subtitle = "Cumulative returns for hybrid portfolios (100% / 75% / 50% / 25% / 0% Duration-Based)",
+      x = "Date",
+      y = "Cumulative Return (%)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold", size = 11),
+      legend.text = element_text(size = 10),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 11, face = "bold")
+    ) +
+    guides(
+      color = guide_legend(nrow = 2, override.aes = list(size = 1.5)),
+      linetype = guide_legend(nrow = 2)
+    )
+  
+  print(p)
+}
+```
+
+
+# ============================================================================
+# PERFORMANCE METRICS FOR HYBRID PORTFOLIOS
+# ============================================================================
+```{r}
+
+# Calculate performance metrics for all hybrid portfolios
+hybrid_performance_overall <- data.frame()
+hybrid_performance_yearly <- list()
+
+for (yr in c(years, "Overall")) {
+  hybrid_performance_yearly[[as.character(yr)]] <- data.frame()
+}
+
+risk_free_rate_pct <- 1.0  # 1% annual
+
+for (full_name in names(all_hybrid_results)) {
+  
+  hybrid_portfolio <- all_hybrid_results[[full_name]]$portfolio
+  
+  # Overall metrics - use existing calc_performance_metrics function
+  metrics_overall <- calc_performance_metrics(
+    hybrid_portfolio$Portfolio_Value,
+    hybrid_portfolio$Date,
+    risk_free_rate_pct / 100  # Convert to decimal (0.01)
+  )
+  
+  hybrid_performance_overall <- rbind(hybrid_performance_overall, data.frame(
+    Portfolio = full_name,
+    Total_Return_Pct = metrics_overall$Total_Return_Pct,
+    Sharpe_Ratio = metrics_overall$Sharpe_Ratio,
+    Sortino_Ratio = metrics_overall$Sortino_Ratio,
+    Max_Drawdown_Pct = metrics_overall$Max_Drawdown_Pct,
+    Ann_Volatility = metrics_overall$Ann_Volatility,
+    Base_Green = all_hybrid_results[[full_name]]$base_green,
+    Green_Weight = all_hybrid_results[[full_name]]$weight_green
+  ))
+  
+  # Yearly metrics
+  hybrid_portfolio_year <- hybrid_portfolio %>%
+    mutate(Year = year(Date))
+  
+  for (yr in years) {
+    year_data <- hybrid_portfolio_year %>% filter(Year == yr)
+    
+    if (nrow(year_data) > 1) {
+      # Use existing calc_performance_metrics function
+      metrics_yearly <- calc_performance_metrics(
+        year_data$Portfolio_Value,
+        year_data$Date,
+        risk_free_rate_pct / 100  # Convert to decimal (0.01)
+      )
+      
+      hybrid_performance_yearly[[as.character(yr)]] <- rbind(
+        hybrid_performance_yearly[[as.character(yr)]],
+        data.frame(
+          Portfolio = full_name,
+          Year = yr,
+          Total_Return_Pct = metrics_yearly$Total_Return_Pct,
+          Sharpe_Ratio = metrics_yearly$Sharpe_Ratio,
+          Sortino_Ratio = metrics_yearly$Sortino_Ratio,
+          Max_Drawdown_Pct = metrics_yearly$Max_Drawdown_Pct,
+          Ann_Volatility = metrics_yearly$Ann_Volatility,
+          Base_Green = all_hybrid_results[[full_name]]$base_green,
+          Green_Weight = all_hybrid_results[[full_name]]$weight_green
+        )
+      )
+    }
+  }
+}
+
+# Display overall performance
+cat("\n\n", rep("=", 100), "\n")
+cat("HYBRID PORTFOLIO PERFORMANCE - OVERALL\n")
+cat(rep("=", 100), "\n\n")
+
+hybrid_performance_overall_display <- hybrid_performance_overall %>%
+  arrange(Base_Green, desc(Green_Weight)) %>%
+  dplyr::select(Portfolio, Green_Weight, Total_Return_Pct, Sharpe_Ratio, 
+         Sortino_Ratio, Max_Drawdown_Pct, Ann_Volatility)
+
+print(hybrid_performance_overall_display, row.names = FALSE)
+```
+
+# ============================================================================
+# COMPARISON TABLES: HYBRIDS VS PURE PORTFOLIOS
+# ============================================================================
+```{r}
+
+# For each green portfolio, create comparison table with its hybrids
+for (green_port in green_portfolios) {
+  
+  cat("\n\n", rep("=", 80), "\n")
+  cat("PERFORMANCE COMPARISON:", green_port, "\n")
+  cat(rep("=", 80), "\n\n")
+  
+  # Collect relevant portfolios
+  comparison_portfolios <- c(
+    green_port,
+    paste0(green_port, "_Hybrid_75_25"),
+    paste0(green_port, "_Hybrid_50_50"),
+    paste0(green_port, "_Hybrid_25_75"),
+    "Treasury"
+  )
+  
+  # Build comparison table
+  comp_table <- data.frame()
+  
+  for (port in comparison_portfolios) {
+    if (port == "Treasury") {
+      # Treasury data
+      metrics <- performance_metrics_overall %>% filter(Portfolio == "Treasury")
+      green_pct <- 0
+    } else if (port == green_port) {
+      # Pure green
+      metrics <- performance_metrics_overall %>% filter(Portfolio == green_port)
+      green_pct <- 100
+    } else {
+      # Hybrid
+      metrics <- hybrid_performance_overall %>% filter(Portfolio == port)
+      green_pct <- metrics$Green_Weight * 100
+    }
+    
+    comp_table <- rbind(comp_table, data.frame(
+      Portfolio = port,
+      Green_Pct = green_pct,
+      Return = metrics$Total_Return_Pct,
+      Sharpe = metrics$Sharpe_Ratio,
+      Sortino = metrics$Sortino_Ratio,
+      Max_DD = metrics$Max_Drawdown_Pct,
+      Volatility = metrics$Ann_Volatility
+    ))
+  }
+  
+  print(comp_table, row.names = FALSE, digits = 3)
+}
+```
+
+# ============================================================================
+# YEARLY PERFORMANCE TABLES FOR HYBRIDS
+# ============================================================================
+```{r}
+
+for (green_port in green_portfolios) {
+  
+  cat("\n\n", rep("=", 80), "\n")
+  cat("YEARLY PERFORMANCE:", green_port, "HYBRIDS\n")
+  cat(rep("=", 80), "\n\n")
+  
+  # Collect relevant portfolios
+  comparison_portfolios <- c(
+    green_port,
+    paste0(green_port, "_Hybrid_75_25"),
+    paste0(green_port, "_Hybrid_50_50"),
+    paste0(green_port, "_Hybrid_25_75"),
+    "Treasury"
+  )
+  
+  # Create yearly table
+  for (yr in years) {
+    cat("\n--- Year:", yr, "---\n")
+    
+    yearly_comp <- data.frame()
+    
+    for (port in comparison_portfolios) {
+      
+      # Get the appropriate metrics
+      if (port == "Treasury") {
+        metrics <- performance_metrics_yearly[[as.character(yr)]] %>% 
+          filter(Portfolio == "Treasury")
+        w_green <- 0
+      } else if (port == green_port) {
+        metrics <- performance_metrics_yearly[[as.character(yr)]] %>% 
+          filter(Portfolio == green_port)
+        w_green <- 100
+      } else {
+        metrics <- hybrid_performance_yearly[[as.character(yr)]] %>% 
+          filter(Portfolio == port)
+        
+        # Get green weight from hybrid results
+        if (port %in% names(all_hybrid_results)) {
+          w_green <- all_hybrid_results[[port]]$weight_green * 100
+        } else {
+          w_green <- NA
+        }
+      }
+      
+      # Only add row if we have valid data with all required columns
+      if (nrow(metrics) > 0 && 
+          !is.null(metrics$Total_Return_Pct) && 
+          !is.null(metrics$Sharpe_Ratio) &&
+          !is.null(metrics$Sortino_Ratio) &&
+          !is.null(metrics$Max_Drawdown_Pct) &&
+          !is.null(metrics$Ann_Volatility)) {
+        
+        yearly_comp <- rbind(yearly_comp, data.frame(
+          Portfolio = port,
+          Green_Pct = w_green,
+          Return = as.numeric(metrics$Total_Return_Pct[1]),
+          Sharpe = as.numeric(metrics$Sharpe_Ratio[1]),
+          Sortino = as.numeric(metrics$Sortino_Ratio[1]),
+          Max_DD = as.numeric(metrics$Max_Drawdown_Pct[1]),
+          Volatility = as.numeric(metrics$Ann_Volatility[1]),
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+    
+    if (nrow(yearly_comp) > 0) {
+      print(yearly_comp, row.names = FALSE, digits = 3)
+    } else {
+      cat("  No data available for this year.\n")
+    }
+  }
+}
+```
+
+# ============================================================================
+# LATEX TABLE FOR HYBRIDS (Table 8)
+# ============================================================================
+```{r}
+
+
+for (dur_port in duration_portfolios) {
+  
+  cat("\n\n", rep("=", 100), "\n")
+  cat("LATEX TABLE FOR:", dur_port, "DURATION-BASED HYBRIDS\n")
+  cat(rep("=", 100), "\n\n")
+  
+  # Portfolio names
+  portfolios_for_table <- c(
+    dur_port,
+    paste0(dur_port, "_Hybrid_75_25"),
+    paste0(dur_port, "_Hybrid_50_50"),
+    paste0(dur_port, "_Hybrid_25_75"),
+    "Treasury"
+  )
+  
+  portfolio_labels <- c(
+    paste0(dur_port, " (100\\% Duration-Based)"),
+    paste0(dur_port, " (75\\% Duration-Based)"),
+    paste0(dur_port, " (50\\% Duration-Based)"),
+    paste0(dur_port, " (25\\% Duration-Based)"),
+    "Treasury (0\\% Duration-Based)"
+  )
+  
+  # Initialize table
+  latex_duration_table <- data.frame(Portfolio = portfolio_labels)
+  
+  # Add yearly columns
+  for (yr in years) {
+    yearly_data_pure <- performance_metrics_yearly[[as.character(yr)]]
+    yearly_data_hybrid <- hybrid_performance_yearly[[as.character(yr)]]
+    
+    for (metric in c("Return", "Sharpe", "Sortino", "MaxDD")) {
+      col_name <- paste0(metric, "_", yr)
+      
+      latex_duration_table[[col_name]] <- sapply(1:length(portfolios_for_table), function(i) {
+        port <- portfolios_for_table[i]
+        
+        if (port == "Treasury" || port == dur_port) {
+          idx <- which(yearly_data_pure$Portfolio == port)
+          if (length(idx) > 0) {
+            if (metric == "Return") return(yearly_data_pure$Total_Return_Pct[idx])
+            if (metric == "Sharpe") return(yearly_data_pure$Sharpe_Ratio[idx])
+            if (metric == "Sortino") return(yearly_data_pure$Sortino_Ratio[idx])
+            if (metric == "MaxDD") return(yearly_data_pure$Max_Drawdown_Pct[idx])
+          }
+        } else {
+          idx <- which(yearly_data_hybrid$Portfolio == port)
+          if (length(idx) > 0) {
+            if (metric == "Return") return(yearly_data_hybrid$Total_Return_Pct[idx])
+            if (metric == "Sharpe") return(yearly_data_hybrid$Sharpe_Ratio[idx])
+            if (metric == "Sortino") return(yearly_data_hybrid$Sortino_Ratio[idx])
+            if (metric == "MaxDD") return(yearly_data_hybrid$Max_Drawdown_Pct[idx])
+          }
+        }
+        return(NA)
+      })
+    }
+  }
+  
+  # Add overall columns
+  overall_data_pure <- performance_metrics_overall
+  overall_data_hybrid <- hybrid_performance_overall
+  
+  for (metric in c("Return", "Sharpe", "Sortino", "MaxDD")) {
+    col_name <- paste0(metric, "_Overall")
+    
+    latex_duration_table[[col_name]] <- sapply(1:length(portfolios_for_table), function(i) {
+      port <- portfolios_for_table[i]
+      
+      if (port == "Treasury" || port == dur_port) {
+        idx <- which(overall_data_pure$Portfolio == port)
+        if (length(idx) > 0) {
+          if (metric == "Return") return(overall_data_pure$Total_Return_Pct[idx])
+          if (metric == "Sharpe") return(overall_data_pure$Sharpe_Ratio[idx])
+          if (metric == "Sortino") return(overall_data_pure$Sortino_Ratio[idx])
+          if (metric == "MaxDD") return(overall_data_pure$Max_Drawdown_Pct[idx])
+        }
+      } else {
+        idx <- which(overall_data_hybrid$Portfolio == port)
+        if (length(idx) > 0) {
+          if (metric == "Return") return(overall_data_hybrid$Total_Return_Pct[idx])
+          if (metric == "Sharpe") return(overall_data_hybrid$Sharpe_Ratio[idx])
+          if (metric == "Sortino") return(overall_data_hybrid$Sortino_Ratio[idx])
+          if (metric == "MaxDD") return(overall_data_hybrid$Max_Drawdown_Pct[idx])
+        }
+      }
+      return(NA)
+    })
+  }
+  
+  # Generate LaTeX output
+  cat("\\begin{table}[htbp]\n")
+  cat("\\centering\n")
+  cat(sprintf("\\caption{Hybrid Portfolio Performance: %s (10-Year Duration Target, 2020--2024)}\n", dur_port))
+  cat(sprintf("\\label{tab:hybrid_duration_%s}\n", tolower(gsub(" ", "_", dur_port))))
+  cat("\\resizebox{\\textwidth}{!}{\n")
+  cat("\\begin{tabular}{l", paste(rep("r", ncol(latex_duration_table) - 1), collapse = ""), "}\n")
+  cat("\\hline\\hline\n")
+  
+  # Headers
+  header1 <- "Portfolio"
+  for (yr in years) {
+    header1 <- paste0(header1, " & \\multicolumn{4}{c}{", yr, "}")
+  }
+  header1 <- paste0(header1, " & \\multicolumn{4}{c}{Overall} \\\\\n")
+  cat(header1)
+  
+  header2 <- " "
+  for (yr in c(years, "Overall")) {
+    header2 <- paste0(header2, " & Return & Sharpe & Sortino & Max DD")
+  }
+  header2 <- paste0(header2, " \\\\\n")
+  cat(header2)
+  
+  header3 <- " "
+  for (yr in c(years, "Overall")) {
+    header3 <- paste0(header3, " & (\\%) & & & (\\%)")
+  }
+  header3 <- paste0(header3, " \\\\\n")
+  cat(header3)
+  cat("\\hline\n")
+  
+  # Data rows (3 decimal places)
+  for (i in 1:nrow(latex_duration_table)) {
+    row_str <- latex_duration_table$Portfolio[i]
+    
+    for (yr in years) {
+      ret <- sprintf("%.3f", latex_duration_table[[paste0("Return_", yr)]][i])
+      sha <- sprintf("%.3f", latex_duration_table[[paste0("Sharpe_", yr)]][i])
+      sor <- sprintf("%.3f", latex_duration_table[[paste0("Sortino_", yr)]][i])
+      mdd <- sprintf("%.3f", latex_duration_table[[paste0("MaxDD_", yr)]][i])
+      row_str <- paste0(row_str, " & ", ret, " & ", sha, " & ", sor, " & ", mdd)
+    }
+    
+    # Overall (3 decimal)
+    ret_ov <- sprintf("%.3f", latex_duration_table$Return_Overall[i])
+    sha_ov <- sprintf("%.3f", latex_duration_table$Sharpe_Overall[i])
+    sor_ov <- sprintf("%.3f", latex_duration_table$Sortino_Overall[i])
+    mdd_ov <- sprintf("%.3f", latex_duration_table$MaxDD_Overall[i])
+    row_str <- paste0(row_str, " & ", ret_ov, " & ", sha_ov, " & ", sor_ov, " & ", mdd_ov)
+    
+    cat(row_str, " \\\\\n")
+  }
+  
+  cat("\\hline\\hline\n")
+  cat("\\end{tabular}\n")
+  cat("}\n")
+  cat("\\end{table}\n\n")
+}
+
+
+```
+
+
+# ============================================================================
+# PREPARE COMBINED RETURNS DATA FOR HYBRID ANALYSIS
+# ============================================================================
+```{r}
+
+# Combine all returns data: pure portfolios + hybrids + treasury
+combined_returns <- data.frame()
+
+# Add pure duration-based portfolios (100%)
+for (green_port in green_portfolios) {
+  portfolio_data <- all_results[[green_port]]$portfolio %>%
+    mutate(Year = year(Date))
+  
+  # Yearly data
+  for (yr in years) {
+    year_data <- portfolio_data %>% filter(Year == yr)
+    if (nrow(year_data) > 1) {
+      daily_returns <- calc_daily_returns(year_data$Portfolio_Value)
+      combined_returns <- rbind(combined_returns, data.frame(
+        Portfolio = green_port,
+        Year = as.character(yr),
+        Daily_Return = daily_returns,
+        Base_Green = green_port,
+        Green_Weight = 1.0
+      ))
+    }
+  }
+  
+  # Overall data
+  daily_returns_overall <- calc_daily_returns(portfolio_data$Portfolio_Value)
+  combined_returns <- rbind(combined_returns, data.frame(
+    Portfolio = green_port,
+    Year = "Overall",
+    Daily_Return = daily_returns_overall,
+    Base_Green = green_port,
+    Green_Weight = 1.0
+  ))
+}
+
+# Add hybrid portfolios
+for (full_name in names(all_hybrid_results)) {
+  hybrid_info <- all_hybrid_results[[full_name]]
+  
+  portfolio_data <- hybrid_info$portfolio %>%
+    mutate(Year = year(Date))
+  
+  # Yearly data
+  for (yr in years) {
+    year_data <- portfolio_data %>% filter(Year == yr)
+    if (nrow(year_data) > 1) {
+      daily_returns <- calc_daily_returns(year_data$Portfolio_Value)
+      combined_returns <- rbind(combined_returns, data.frame(
+        Portfolio = full_name,
+        Year = as.character(yr),
+        Daily_Return = daily_returns,
+        Base_Green = hybrid_info$base_green,
+        Green_Weight = hybrid_info$weight_green
+      ))
+    }
+  }
+  
+  # Overall data
+  daily_returns_overall <- calc_daily_returns(portfolio_data$Portfolio_Value)
+  combined_returns <- rbind(combined_returns, data.frame(
+    Portfolio = full_name,
+    Year = "Overall",
+    Daily_Return = daily_returns_overall,
+    Base_Green = hybrid_info$base_green,
+    Green_Weight = hybrid_info$weight_green
+  ))
+}
+
+# Add Treasury (0%)
+treasury_data_year <- treasury_result$portfolio %>%
+  mutate(Year = year(Date))
+
+for (yr in years) {
+  year_data <- treasury_data_year %>% filter(Year == yr)
+  if (nrow(year_data) > 1) {
+    daily_returns <- calc_daily_returns(year_data$Portfolio_Value)
+    combined_returns <- rbind(combined_returns, data.frame(
+      Portfolio = "Treasury",
+      Year = as.character(yr),
+      Daily_Return = daily_returns,
+      Base_Green = NA,
+      Green_Weight = 0
+    ))
+  }
+}
+
+# Overall Treasury
+daily_returns_treasury_overall <- calc_daily_returns(treasury_result$portfolio$Portfolio_Value)
+combined_returns <- rbind(combined_returns, data.frame(
+  Portfolio = "Treasury",
+  Year = "Overall",
+  Daily_Return = daily_returns_treasury_overall,
+  Base_Green = NA,
+  Green_Weight = 0
+))
+
+# Set Year factor levels
+year_levels <- c(as.character(years), "Overall")
+combined_returns$Year <- factor(combined_returns$Year, levels = year_levels)
+
+cat("\n=== Combined Returns Data Created ===\n")
+cat("Total rows:", nrow(combined_returns), "\n")
+cat("Portfolios included:", length(unique(combined_returns$Portfolio)), "\n")
+cat("Years:", paste(unique(combined_returns$Year), collapse = ", "), "\n\n")
+
+```
+
+# ============================================================================
+# BOX PLOTS FOR DURATION-BASED HYBRID PORTFOLIOS (Fig 14)
+# ============================================================================
+```{r}
+
+# Calculate consistent y-axis limits
+all_hybrid_returns <- combined_returns %>%
+  filter(!is.na(Daily_Return))
+
+y_range_hybrid <- range(all_hybrid_returns$Daily_Return, na.rm = TRUE)
+y_padding_hybrid <- diff(y_range_hybrid) * 0.05
+y_limits_hybrid <- c(y_range_hybrid[1] - y_padding_hybrid, y_range_hybrid[2] + y_padding_hybrid)
+
+cat("\n=== Y-axis limits:", round(y_limits_hybrid[1], 2), "to", round(y_limits_hybrid[2], 2), "===\n\n")
+
+# Create box plots for each duration-based portfolio
+for (green_port in green_portfolios) {
+  
+  cat("\n--- Box plots for:", green_port, "---\n")
+  
+  # Filter data
+  box_data_all <- combined_returns %>%
+    filter(Base_Green == green_port | Portfolio == "Treasury") %>%
+    mutate(
+      Portfolio_Label = case_when(
+        Portfolio == "Treasury" ~ "Treasury\n(0%)",
+        Green_Weight == 1.0 ~ paste0(green_port, "\n(100%)"),
+        TRUE ~ sprintf("%s\n(%.0f%%)", green_port, Green_Weight * 100)
+      ),
+      Portfolio_Label = factor(Portfolio_Label, 
+                               levels = unique(Portfolio_Label[order(-Green_Weight)])),
+      # Green percentage for color mapping
+      Green_Pct = case_when(
+        Portfolio == "Treasury" ~ 0,
+        TRUE ~ Green_Weight * 100
+      )
+    )
+  
+  # Create color gradient matching your scale: navy (0%) to lightgreen (100%)
+  color_gradient <- colorRampPalette(c("navy", "lightgreen"))(101)  # 0-100%
+  
+  # Get unique portfolios and assign colors based on green percentage
+  unique_portfolios <- box_data_all %>%
+    dplyr::select(Portfolio_Label, Green_Pct) %>%
+    distinct() %>%
+    arrange(desc(Green_Pct))
+  
+  # Map colors based on green percentage
+  hybrid_colors <- sapply(unique_portfolios$Green_Pct, function(pct) {
+    color_gradient[round(pct) + 1]  # +1 because index starts at 1
+  })
+  names(hybrid_colors) <- unique_portfolios$Portfolio_Label
+  
+  # Set Year factor levels
+  year_levels <- c(as.character(years), "Overall")
+  box_data_all$Year <- factor(box_data_all$Year, levels = year_levels)
+  
+  # -------------------------------------------------------------------------
+  # PLOT 1: Yearly + Overall in facets
+  # -------------------------------------------------------------------------
+  p_box_with_overall <- ggplot(box_data_all, aes(x = Portfolio_Label, y = Daily_Return, 
+                                                   fill = Portfolio_Label)) +
+    geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+    facet_wrap(~ Year, nrow = 1) +
+    scale_fill_manual(values = hybrid_colors) +
+    coord_cartesian(ylim = y_limits_hybrid) +
+    labs(
+      #title = paste("Daily Return Distribution (Yearly + Overall):", green_port, "Hybrids"),
+      x = "Portfolio",
+      y = "Daily Return (%)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 5),
+      axis.title = element_text(size = 11, face = "bold"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      plot.background = element_rect(color = "black", fill = NA, linewidth = 1),
+      panel.spacing = unit(0.5, "lines")
+    )
+  
+  print(p_box_with_overall)
+  
+  # -------------------------------------------------------------------------
+  # PLOT 2: Overall only
+  # -------------------------------------------------------------------------
+  box_data_overall <- box_data_all %>% filter(Year == "Overall")
+  
+  p_box_overall_only <- ggplot(box_data_overall, aes(x = Portfolio_Label, y = Daily_Return, 
+                                                       fill = Portfolio_Label)) +
+    geom_boxplot(outlier.size = 1, outlier.alpha = 0.4, width = 0.6) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3, 
+                 fill = "white", color = "black") +
+    scale_fill_manual(values = hybrid_colors) +
+    coord_cartesian(ylim = y_limits_hybrid) +
+    labs(
+      title = paste("Overall Daily Return Distribution:", green_port, "Hybrids"),
+      subtitle = "Diamond marks represent mean returns",
+      x = "Portfolio",
+      y = "Daily Return (%)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5),
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+      axis.title = element_text(size = 12, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(p_box_overall_only)
+}
+```
+
+# ============================================================================
+# RISK-RETURN SCATTER PLOT FOR HYBRIDS (Fig 15)
+# ============================================================================
+```{r fig.width=12, fig.height=8}
+
+library(ggrepel)
+
+# Calculate consistent scales
+all_scatter_data <- data.frame()
+
+for (green_port in green_portfolios) {
+  comparison_portfolios <- c(
+    green_port,
+    paste0(green_port, "_Hybrid_75_25"),
+    paste0(green_port, "_Hybrid_50_50"),
+    paste0(green_port, "_Hybrid_25_75"),
+    "Treasury"
+  )
+  
+  for (port in comparison_portfolios) {
+    if (port == "Treasury") {
+      metrics <- performance_metrics_overall %>% filter(Portfolio == "Treasury")
+      green_pct <- 0
+      returns <- calc_daily_returns(treasury_result$portfolio$Portfolio_Value)
+    } else if (port == green_port) {
+      metrics <- performance_metrics_overall %>% filter(Portfolio == green_port)
+      green_pct <- 100
+      returns <- calc_daily_returns(all_results[[green_port]]$portfolio$Portfolio_Value)
+    } else {
+      metrics <- hybrid_performance_overall %>% filter(Portfolio == port)
+      green_pct <- metrics$Green_Weight * 100
+      returns <- calc_daily_returns(all_hybrid_results[[port]]$portfolio$Portfolio_Value)
+    }
+    
+    volatility <- sd(returns, na.rm = TRUE) * sqrt(252) * 100
+    
+    all_scatter_data <- rbind(all_scatter_data, data.frame(
+      Green_Portfolio = green_port,
+      Return = metrics$Total_Return_Pct,
+      Volatility = volatility,
+      Green_Pct = green_pct,
+      Sharpe = metrics$Sharpe_Ratio
+    ))
+  }
+}
+
+vol_range <- range(all_scatter_data$Volatility, na.rm = TRUE)
+ret_range <- range(all_scatter_data$Return, na.rm = TRUE)
+vol_padding <- diff(vol_range) * 0.1
+ret_padding <- diff(ret_range) * 0.1
+vol_limits <- c(vol_range[1] - vol_padding, vol_range[2] + vol_padding)
+ret_limits <- c(ret_range[1] - ret_padding, ret_range[2] + ret_padding)
+
+# Create plots with compact legends
+for (green_port in green_portfolios) {
+  
+  cat("\n--- Risk-return scatter for:", green_port, "---\n")
+  
+  comparison_portfolios <- c(
+    green_port,
+    paste0(green_port, "_Hybrid_75_25"),
+    paste0(green_port, "_Hybrid_50_50"),
+    paste0(green_port, "_Hybrid_25_75"),
+    "Treasury"
+  )
+  
+  scatter_data <- data.frame()
+  
+  for (port in comparison_portfolios) {
+    if (port == "Treasury") {
+      metrics <- performance_metrics_overall %>% filter(Portfolio == "Treasury")
+      green_pct <- 0
+      label <- "Treasury (0%)"
+    } else if (port == green_port) {
+      metrics <- performance_metrics_overall %>% filter(Portfolio == green_port)
+      green_pct <- 100
+      label <- paste0(green_port, " (100%)")
+    } else {
+      metrics <- hybrid_performance_overall %>% filter(Portfolio == port)
+      green_pct <- metrics$Green_Weight * 100
+      label <- sprintf("%s (%.0f%%)", green_port, green_pct)
+    }
+    
+    if (port == "Treasury") {
+      returns <- calc_daily_returns(treasury_result$portfolio$Portfolio_Value)
+    } else if (port == green_port) {
+      returns <- calc_daily_returns(all_results[[green_port]]$portfolio$Portfolio_Value)
+    } else {
+      returns <- calc_daily_returns(all_hybrid_results[[port]]$portfolio$Portfolio_Value)
+    }
+    
+    volatility <- sd(returns, na.rm = TRUE) * sqrt(252) * 100
+    
+    scatter_data <- rbind(scatter_data, data.frame(
+      Portfolio = label,
+      Return = metrics$Total_Return_Pct,
+      Volatility = volatility,
+      Green_Pct = green_pct,
+      Sharpe = metrics$Sharpe_Ratio
+    ))
+  }
+  
+  # Plot with COMPACT legends
+  p_scatter <- ggplot(scatter_data, aes(x = Volatility, y = Return, 
+                                        color = Green_Pct, size = Sharpe)) +
+    geom_point(alpha = 0.8) +
+    geom_label_repel(
+      aes(label = Portfolio), 
+      size = 3.5,
+      box.padding = 0.8,
+      point.padding = 0.5,
+      segment.color = "grey50",
+      segment.size = 0.3,
+      max.overlaps = 20,
+      show.legend = FALSE,
+      force = 2,
+      min.segment.length = 0,
+      fill = alpha("white", 0.9),
+      label.padding = unit(0.25, "lines")
+    ) +
+    scale_color_gradient(
+      low = "navy", 
+      high = "lightgreen", 
+      name = "Green %",
+      breaks = c(0, 25, 50, 75, 100)
+    ) +
+    scale_size_continuous(
+      range = c(3, 12), 
+      name = "Sharpe Ratio"
+    ) +
+    coord_cartesian(xlim = vol_limits, ylim = ret_limits) +
+    labs(
+      #title = paste("Risk-Return Profile:", green_port, "Hybrids"),
+      #subtitle = "Point size represents Sharpe ratio",
+      x = "Volatility (Annualized %)",
+      y = "Total Return (%)"
+    ) +
+    # Compact legend styling
+    guides(
+      color = guide_colorbar(
+        barwidth = 1.2,        # Narrower color bar
+        barheight = 8,         # Shorter height
+        title.position = "top",
+        title.hjust = 0.5,
+        label.position = "right"
+      ),
+      size = guide_legend(
+        title.position = "top",
+        title.hjust = 0.5,
+        nrow = 4,              # Stack size legend vertically
+        byrow = TRUE,
+        override.aes = list(alpha = 0.8)
+      )
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11),
+      legend.position = "right",
+      legend.box = "vertical",
+      legend.spacing = unit(0.3, "cm"),
+      # Smaller legend text
+      legend.title = element_text(size = 9, face = "bold"),
+      legend.text = element_text(size = 8),
+      # Smaller legend keys
+      legend.key.size = unit(0.4, "cm"),
+      legend.key.height = unit(0.4, "cm"),
+      legend.key.width = unit(0.4, "cm"),
+      # Margins
+      legend.margin = margin(t = 0, r = 5, b = 0, l = 5),
+      legend.box.spacing = unit(0.2, "cm"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_line(color = "grey95")
+    )
+  
+  print(p_scatter)
+}
+```
+
+# ============================================================================
+# SUMMARY STATISTICS TABLE FOR ALL HYBRIDS
+# ============================================================================
+```{r}
+
+cat("\n\n", rep("=", 100), "\n")
+cat("COMPREHENSIVE HYBRID PERFORMANCE SUMMARY\n")
+cat(rep("=", 100), "\n\n")
+
+# Combine all portfolios
+all_performance <- rbind(
+  performance_metrics_overall %>% 
+    mutate(Green_Weight = ifelse(Portfolio == "Treasury", 0, 1),
+           Base_Green = Portfolio) %>%
+    dplyr::select(Portfolio, Base_Green, Green_Weight, Total_Return_Pct, 
+           Sharpe_Ratio, Sortino_Ratio, Max_Drawdown_Pct, Ann_Volatility),
+  hybrid_performance_overall %>%
+    dplyr::select(Portfolio, Base_Green, Green_Weight, Total_Return_Pct, 
+           Sharpe_Ratio, Sortino_Ratio, Max_Drawdown_Pct, Ann_Volatility)
+)
+
+# Sort by base portfolio and green weight
+all_performance <- all_performance %>%
+  arrange(Base_Green, desc(Green_Weight))
+
+print(all_performance, row.names = FALSE, digits = 3)
+
+# Summary by green weight level
+cat("\n\n--- Performance by Green Weight Level ---\n\n")
+
+weight_summary <- all_performance %>%
+  group_by(Green_Weight) %>%
+  summarize(
+    N_Portfolios = n(),
+    Avg_Return = mean(Total_Return_Pct, na.rm = TRUE),
+    Avg_Sharpe = mean(Sharpe_Ratio, na.rm = TRUE),
+    Avg_Sortino = mean(Sortino_Ratio, na.rm = TRUE),
+    Avg_MaxDD = mean(Max_Drawdown_Pct, na.rm = TRUE),
+    Avg_Volatility = mean(Ann_Volatility, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Green_Pct = Green_Weight * 100) %>%
+  dplyr::select(Green_Pct, everything(), -Green_Weight)
+
+print(weight_summary, row.names = FALSE, digits = 3)
+```
+

@@ -1,0 +1,535 @@
+---
+title: "Spreads' summary and trend"
+author: "Hadi"
+output: html_document
+---
+
+
+```{r}
+library(arules)
+library(arulesViz)
+library(knitr)
+library(plyr)
+library(dplyr)
+library(RColorBrewer)
+library(stringr)
+library(quantmod)
+library(splines2)
+library(splines)
+library(mgcv)
+library(RQuantLib)
+library(tidyr)
+library(xts)
+library(plotly)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(tidyverse)
+#library(plot3D)
+#library(rgl)
+library (zoo)
+library(plotly)
+library(writexl)
+library(YieldCurve)
+library(patchwork)
+library(gridExtra)
+library(stargazer)
+library(scales)
+library(pdfetch)
+library(xtable)
+```
+
+
+
+#Load dataset
+```{r}
+
+MLFeat <- 
+  read_excel("/path/to/data")
+
+California <- readRDS("/path/to/data")
+
+```
+
+
+# Grouping Criteria
+
+Callable and Non_callable Bond dataset
+```{r}
+Cal_callable <- California %>% filter(CALLABLE == "TRUE", CPN != 15, CPN_FREQ != 12)
+
+Cal_non_callable <- California %>% filter(CALLABLE == "FALSE", CPN != 15, CPN_FREQ != 12)
+
+
+# Coupon intervals:
+#Construct partitions based on the coupon intervals for California (Callable and non-callable)
+
+interval_non_call <- cut(Cal_non_callable$CPN, breaks = c(0, 2.99, 4.999, 7.69), labels = c("CPN_0_3", "CPN_3_5", "CPN_5_8"))
+Cal_non_callable <- Cal_non_callable %>% mutate(CPN_Group = interval_non_call)
+
+interval_call <- cut(Cal_callable$CPN, breaks = c(0, 3.5, 4.999, 8.5), labels = c("CPN_0_3.5", "CPN_3.5_5", "CPN_5_8.5"))
+
+Cal_callable <- Cal_callable %>% mutate(CPN_Group = interval_call)
+
+
+# Partitioning California dataset based on tax provinces
+
+# --- Tax provinces to EXCLUDE in the "op" groups ---
+excluded_tax <- c(
+  "FED TAXABLE/ST TAX-EXEMPT",
+  "FED TAXABLE",
+  "FED TAXABLE/ST TAXABLE"
+)
+
+# --------- NON-CALLABLE ---------
+
+# Non-callable bonds with coupon intervals of 0–3 percent
+G1_nc_all <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3",
+    Date >= as.Date("2020-01-01")
+  )
+
+# Non-callable bonds with coupon intervals of 3–5 percent
+# EXCLUDING taxable/taxable-mixed provinces
+G2_nc_op <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_3_5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)    
+  )
+
+# Non-callable bonds with coupon intervals of 3–5 percent
+# WITHIN "FED TAXABLE/ST TAX-EXEMPT" province
+G2_nc_ft <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_3_5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+# Non-callable bonds with coupon intervals of 5–8 percent
+G3_nc_all <- Cal_non_callable %>%
+  filter(
+    CPN_Group == "CPN_5_8",
+    Date >= as.Date("2020-01-01")
+  )
+
+# --------- CALLABLE ---------
+
+# Callable bonds with coupon intervals of 0–3.5 percent
+# EXCLUDING taxable/taxable-mixed provinces
+G1_c_op <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3.5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)     
+  )
+
+# Callable bonds with coupon intervals of 0–3.5 percent
+# WITHIN "FED TAXABLE/ST TAX-EXEMPT" province
+G1_c_ft <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_0_3.5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+# Callable bonds with coupon intervals of 3.5–5 percent
+# EXCLUDING taxable/taxable-mixed provinces
+G2_c_op <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_3.5_5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)     
+  )
+
+# Callable bonds with coupon intervals of 3.5–5 percent
+# WITHIN "FED TAXABLE/ST TAX-EXEMPT" province
+G2_c_ft <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_3.5_5",
+    Date >= as.Date("2020-01-01"),
+    MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT"
+  )
+
+# Callable bonds with coupon intervals of 5–8.5 percent
+# EXCLUDING taxable/taxable-mixed provinces
+G3_c_all <- Cal_callable %>%
+  filter(
+    CPN_Group == "CPN_5_8.5",
+    Date >= as.Date("2020-01-01"),
+    !is.na(MUNI_TAX_PROV),
+    !(MUNI_TAX_PROV %in% excluded_tax)    
+  )
+```
+
+
+# Statistical summary of coupon rates of green bonds in California (Table C.1)
+```{r}
+
+# Calculate summary statistics
+summary_stats <- California %>%
+  group_by(CALLABLE) %>%
+  summarise(
+    `No. of Bonds` = n_distinct(ID_CUSIP),
+    Min. = round(min(CPN, na.rm = TRUE), 2),
+    `1st Qu.` = round(quantile(CPN, 0.25, na.rm = TRUE), 2),
+    Median = round(median(CPN, na.rm = TRUE), 2),
+    Mean = round(mean(CPN, na.rm = TRUE), 2),
+    `3rd Qu.` = round(quantile(CPN, 0.75, na.rm = TRUE), 2),
+    Max. = round(max(CPN, na.rm = TRUE), 2),
+    St.dev. = round(sd(CPN, na.rm = TRUE), 2),
+    .groups = 'drop'
+  ) %>%
+  mutate(Type = ifelse(CALLABLE, "Callable", "Non-Callable")) %>%
+  dplyr::select(Type, everything(), -CALLABLE)
+
+# Create xtable and print LaTeX
+california_table <- xtable(summary_stats, 
+                          caption = "Statistical summary of coupon rates of bonds in California",
+                          label = "tab:california_summary", digits = 3)
+
+print(california_table, 
+      include.rownames = FALSE,
+      caption.placement = "top",
+      booktabs = TRUE)
+```
+
+
+#Statistical summary of non-callable and callable bonds for partitions of coupon rates (Table C.2)
+```{r}
+
+# Create summary statistics by year, callable status, and coupon group
+summary_stats <- California %>%
+  group_by(year, CALLABLE, CPN_Group) %>%
+  summarise(
+    `No. of Bonds` = n_distinct(ID_CUSIP),
+    Min = round(min(CPN, na.rm = TRUE), 3),
+    Max = round(max(CPN, na.rm = TRUE), 3),
+    Mean = round(mean(CPN, na.rm = TRUE), 3),
+    Median = round(median(CPN, na.rm = TRUE), 3),
+    `3rd Qu.` = round(quantile(CPN, 0.75, na.rm = TRUE), 3),
+    St.dev. = round(sd(CPN, na.rm = TRUE), 3),
+    .groups = 'drop'
+  ) %>%
+  # Convert CPN_Group to readable format
+  mutate(
+    Coupon_Range = case_when(
+      CPN_Group == "CPN_0_3.5" ~ "[0.2-3.0]",
+      CPN_Group == "CPN_3.5_5" ~ "[3.0-5.0]", 
+      CPN_Group == "CPN_5_7.69" ~ "[5.0-7.69]",
+      TRUE ~ CPN_Group
+    ),
+    Callable_Status = ifelse(CALLABLE, "Callable", "Non-Callable")
+  ) %>%
+  dplyr::select(-CPN_Group, -CALLABLE)
+
+# Reshape for the desired table format
+table_data <- summary_stats %>%
+  pivot_wider(
+    names_from = Callable_Status,
+    values_from = c(`No. of Bonds`, Min, Max, Mean, Median, `3rd Qu.`, St.dev.),
+    names_sep = "_"
+  ) %>%
+  arrange(year, Coupon_Range)
+
+# Create xtable
+california_cpn_table <- xtable(table_data, 
+                               caption = "Statistical summary of non-callable and callable bonds for partitions of coupon rates",
+                               label = "tab:california_cpn_summary")
+
+print(california_cpn_table, 
+      include.rownames = FALSE,
+      caption.placement = "top",
+      booktabs = TRUE,
+      scalebox = 0.8)
+
+# Alternative: Create separate tables for each year
+for(yr in unique(California$year)) {
+  cat(paste0("\n=== Year ", yr, " ===\n"))
+  
+  year_data <- summary_stats %>%
+    filter(year == yr) %>%
+    dplyr::select(-year) %>%
+    pivot_wider(
+      names_from = Callable_Status,
+      values_from = c(`No. of Bonds`, Min, Max, Mean, Median, `3rd Qu.`, St.dev.),
+      names_sep = "_"
+    )
+  
+  year_table <- xtable(year_data, 
+                       caption = paste("Statistical summary for year", yr),
+                       label = paste0("tab:california_", yr), digits = 3)
+  
+  print(year_table, 
+        include.rownames = FALSE,
+        caption.placement = "top",
+        booktabs = TRUE)
+}
+
+```
+
+
+Statistical Summary for California
+```{r}
+
+Cal_state <- California %>%
+  group_by(year(Date)) %>%
+  summarise(
+    'Total Bonds' = n_distinct(ID_CUSIP, na.rm = TRUE),
+    'Non-Callable Bonds' =n_distinct(ID_CUSIP[CALLABLE == "FALSE"], na.rm = TRUE),
+    'Callable Bonds' =n_distinct(ID_CUSIP[CALLABLE == "TRUE"], na.rm = TRUE),
+    Min_CPN = round(min(CPN, na.rm = TRUE), 3),
+    Max_CPN = round(max(CPN, na.rm = TRUE), 3),
+    Mean_CPN = round(mean(CPN, na.rm = TRUE), 3),
+    Median_CPN = round(median(CPN, na.rm = TRUE), 3),
+    SD_CPN = round(sd(CPN, na.rm = TRUE), 3),
+    Min_Yield = round(min(yield, na.rm = TRUE), 3),
+    Max_Yield = round(max(yield, na.rm = TRUE), 3),
+    Mean_Yield = round(mean(yield, na.rm = TRUE), 3),
+    Median_Yield = round(median(yield, na.rm = TRUE), 3),
+    SD_Yield = round(sd(yield, na.rm = TRUE), 3)
+  )
+
+view(Cal_state)
+
+```
+
+Comparison of Callable and Non-callable Bonds in California by Year
+```{r}
+
+Cal_state %>%
+  select(`year(Date)`, `Callable Bonds`, `Non-Callable Bonds`) %>%
+  pivot_longer(
+    cols = `Callable Bonds`:`Non-Callable Bonds`,
+    names_to = "Indicator",
+    values_to = "Count"
+  ) %>%
+  ggplot(aes(x = `year(Date)`, y = Count, fill = Indicator)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = Count), position = position_dodge(width = 0.8), size = 2, angle = 0, vjust = -0.5, hjust = 0.3) + 
+
+  labs(
+       x = "Year",
+       y = "Number of Bonds") +
+  scale_fill_manual(values = c("Callable Bonds" = "skyblue", "Non-Callable Bonds" = "darkred")) +
+  scale_x_continuous(breaks = unique(Cal_state$`year(Date)`)) +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+
+```
+
+
+
+#Trend of spread 1 (Fig 2)
+```{r}
+California %>% 
+  filter(year >= 2020) %>%
+  ggplot(aes(x = Date, y = S2)) +
+  geom_line(stat = "summary", fun = "median", aes(group = 1, color = "Median"), linetype = "solid", linewidth = 1, color = "darkgreen")+
+  geom_line(stat = "summary", fun = function(x) quantile(x, 0.25), color = "#99FF99", linetype = "dashed", linewidth = 0.7) +
+  geom_line(stat = "summary", fun = function(x) quantile(x, 0.75), color = "#99FF99", linetype = "dashed", linewidth = 0.7) +
+  theme_minimal() +
+  labs(x = "Date", y = "Median of Spreads") +
+  geom_hline(aes(yintercept = 0),  color = "grey", linewidth = 0.001, show.legend = FALSE) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +  # This line shows all years
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    panel.background = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Optional: rotate labels if crowded
+  ) +
+  coord_cartesian(ylim = c(-1, 1))
+
+
+
+```
+
+
+#Spread  summary table (tabl2 2)
+```{r}
+
+S2_Stat <- California %>% filter(year>= 2016) %>% 
+  group_by(year) %>%
+  dplyr::summarise(
+    Min = round(min(S2, na.rm = TRUE), 3),
+    "1st Qu." = round(quantile(S2, 0.25, na.rm = TRUE), 3),
+    Max = round(max(S2, na.rm = TRUE), 3),
+    Mean = round(mean(S2, na.rm = TRUE), 3),
+    Median = round(median(S2, na.rm = TRUE), 3),
+    "3rd Qu." = round(quantile(S2, 0.75, na.rm = TRUE), 3),
+    SD = round(sd(S2, na.rm = TRUE), 3)
+  )
+S2_all <- California %>%
+  filter(year %in% c(2020, 2021, 2022, 2023)) %>% 
+  dplyr::summarise(
+    Min = round(min(S2, na.rm = TRUE), 3),
+    "1st Qu." = round(quantile(S2, 0.25, na.rm = TRUE), 3),
+    Max = round(max(S2, na.rm = TRUE), 3),
+    Mean = round(mean(S2, na.rm = TRUE), 3),
+    Median = round(median(S2, na.rm = TRUE), 3),
+    "3rd Qu." = round(quantile(S2, 0.75, na.rm = TRUE), 3),
+    SD = round(sd(S2, na.rm = TRUE), 3)
+  )
+
+S2_all$year <- "Total"
+S2_final_state <- rbind(S2_Stat, S2_all)
+
+
+
+#Overleaf table
+
+xtable(S2_final_state, digits = 4)
+
+```
+
+
+#Distribution of Spread (Fig 2)
+```{r}
+California %>%
+  filter(year >= 2020) %>%
+  ggplot(aes(x = S2)) +
+  
+  geom_density(
+    
+    color = "darkgreen",
+    alpha = 0.1,
+    size  = 1    # increase line thickness
+  ) +
+  # median line with legend
+  geom_vline(
+    aes(xintercept = median(S2), color = "Median"),
+    linetype   = "dashed",
+    size       = 1,
+    show.legend= TRUE
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("Median" = "red")
+  ) +
+  coord_cartesian(ylim = c(0, 1.5), xlim = c(-4, 4)) +
+  theme_minimal() +
+  labs(x = "Spread(%)", y = "Density") +
+  theme(
+    panel.border         = element_rect(color = "black", fill = NA, size = 1),
+    panel.background     = element_rect(fill = "white"),
+    legend.position      = c(1, 1),
+    legend.justification = c("right", "top"),
+    # draw a box around legend
+    legend.background    = element_rect(fill = alpha("white", 0.7), color = "black"),
+    legend.key           = element_rect(fill = NA, color = NA)
+  )
+
+
+```
+
+
+# Summary Table (Table 1)
+```{r}
+G1 <-  G1_nc_all %>% summarise(
+  Group = "1",
+  Callability = "Non Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G2 <-  G2_nc_ft %>% summarise(
+  Group = "2",
+  Callability = "Non Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G3 <-  G2_nc_op %>% summarise(
+  Group = "3",
+  Callability = "Non Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G4 <- G3_nc_all %>% summarise(
+  Group = "4",
+  Callability = "Non Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G5 <- G1_c_ft %>% summarise(
+  Group = "5",
+  Callability = "Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G6 <- G1_c_op %>% summarise(
+  Group = "6",
+  Callability = "Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G7 <- G2_c_ft %>% summarise(
+  Group = "7",
+  Callability = "Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G8 <- G2_c_op %>% summarise(
+  Group = "8",
+  Callability = "Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+G9 <- G3_c_all %>% summarise(
+  Group = "9",
+  Callability = "Callable",
+  Coupon = paste(min(CPN), max(CPN), sep = "-"),
+  "Tax Province" = NA,
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n_distinct(ID_CUSIP)
+  )
+Groups <- rbind(G1, G2, G3, G4, G5, G6, G7, G8, G9 )
+```
+Export summary
+```{r}
+print(Groups)
+xtable(Groups,digits = 4)
+```
+
+
+
+

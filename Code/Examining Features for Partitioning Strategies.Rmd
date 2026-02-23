@@ -1,0 +1,619 @@
+---
+title: "Examining Features for Partitioning Strategies"
+author: "Hadi"
+output: html_document
+---
+
+Load libraries
+```{r}
+library(splines2)
+library(splines)
+library(mgcv)
+library(RQuantLib)
+library(tidyr)
+library(xts)
+library(plotly)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(tidyverse)
+library(plot3D)
+library(rgl)
+library(zoo)
+library(plotly)
+library(writexl)
+library(YieldCurve)
+library(patchwork)
+library(gridExtra)
+library(stargazer)
+library(scales)
+library(pdfetch)
+library(xtable)
+library(feather)
+
+```
+
+
+importing data set
+```{r}
+California <- readRDS("/path/to/data")
+
+```
+
+
+# Grouping Criteria
+
+Callable and Non_callable Bond dataset
+```{r}
+Cal_callable <- California %>% filter(CALLABLE == "Callable", CPN != 15, CPN_FREQ != 12)
+
+Cal_non_callable <- California %>% filter(CALLABLE == "Non-Callable", CPN != 15, CPN_FREQ != 12)
+
+summary(Cal_non_callable$CPN)
+```
+
+# Coupon intervals:
+Construct partitions based on the coupon intervals for California (Callable and non-callable)
+```{r}
+interval_non_call <- cut(Cal_non_callable$CPN, breaks = c(0, 2.99, 4.999, 7.69), labels = c("CPN_0_3", "CPN_3_5", "CPN_5_8"))
+Cal_non_callable <- Cal_non_callable %>% mutate(CPN_Group = interval_non_call)
+
+interval_call <- cut(Cal_callable$CPN, breaks = c(0, 3.5, 4.999, 8.5), labels = c("CPN_0_3.5", "CPN_3.5_5", "CPN_5_8.5"))
+
+Cal_callable <- Cal_callable %>% mutate(CPN_Group = interval_call)
+```
+
+
+California Coupon groups (fig C.2).
+```{r}
+
+# Create CPN_range column for California dataset
+California <- California %>%
+  mutate(
+    CPN_range = case_when(
+      CPN >= 0 & CPN < 3 ~ "0_3(%)",
+      CPN >= 3 & CPN < 5 ~ "3_5(%)",
+      CPN >= 5 & CPN <= 8.5 ~ "5_8.5(%)",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+
+# Add year column and convert existing CALLABLE column values
+California <- California %>%
+  mutate(
+    year = year(Date),
+    CALLABLE = ifelse(CALLABLE == TRUE, "Callable", "Non-Callable")
+  )
+
+California$Date <- as.Date(California$Date)
+
+# Define custom colors for CPN_range
+custom_colors <- c(
+  "0_3(%)" = "black",
+  "3_5(%)" = "yellow",
+  "5_8.5(%)" = "green"
+)
+
+California %>%
+  filter(Date >= "2022-05-01", Date <= "2022-05-31", yield < 6) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~CPN_range,  # Use CPN_range for color coding
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+```
+
+
+California Coupon groups all (fig C.6).
+```{r}
+
+California$Date <- as.Date(California$Date)
+
+# Define custom colors for CPN_range
+custom_colors <- c(
+  "0_3(%)" = "black",
+  "3_5(%)" = "yellow",
+  "5_8.5(%)" = "green"
+)
+
+California %>%
+  filter(Date >= "2020-01-01", yield < 6, yield>0) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~CPN_range,  # Use CPN_range for color coding
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+```
+
+
+California CPN groups Statistics
+```{r}
+Cal_state <- California %>% group_by(CPN_Group) %>% 
+  summarise(
+    'Total Bonds' = n_distinct(ID_CUSIP, na.rm = TRUE),
+    Max_CPN = round(max(CPN, na.rm = TRUE), 3),
+    Mean_CPN = round(mean(CPN, na.rm = TRUE), 3),
+    Median_CPN = round(median(CPN, na.rm = TRUE), 3),
+    SD_CPN = round(sd(CPN, na.rm = TRUE), 3),
+    Min_Yield = round(min(yield, na.rm = TRUE), 3),
+    Max_Yield = round(max(yield, na.rm = TRUE), 3),
+    Mean_Yield = round(mean(yield, na.rm = TRUE), 3),
+    Median_Yield = round(median(yield, na.rm = TRUE), 3),
+    SD_Yield = round(sd(yield, na.rm = TRUE), 3)
+  )
+
+
+xtable(Cal_state[, 1:6])
+```
+
+#California CPN groups Statistics through times
+
+```{r}
+
+
+Cal_state_years <- California %>% group_by(CPN_Group, year(Date)) %>% 
+  summarise(
+    No._of_Bonds = n_distinct(ID_CUSIP, na.rm = TRUE),
+    Min_CPN = round(min(CPN, na.rm = TRUE), 3),
+    Max_CPN = round(max(CPN, na.rm = TRUE), 3),
+    Mean_CPN = round(mean(CPN, na.rm = TRUE), 3),
+    Median_CPN = round(median(CPN, na.rm = TRUE), 3),
+    SD_CPN = round(sd(CPN, na.rm = TRUE), 3),
+    Min_Yield = round(min(yield, na.rm = TRUE), 3),
+    Max_Yield = round(max(yield, na.rm = TRUE), 3),
+    Mean_Yield = round(mean(yield, na.rm = TRUE), 3),
+    Median_Yield = round(median(yield, na.rm = TRUE), 3),
+    SD_Yield = round(sd(yield, na.rm = TRUE), 3)
+  )
+
+
+
+```
+
+Tax province bar chart (fig C.4)
+
+```{r}
+# Define specific colors for each tax province
+province_colors <- c(
+  "FED TAXABLE/ST TAX-EXEMPT" = "red",
+  "FED & ST TAX-EXEMPT" = "blue",
+  "FED TAXABLE/ST TAXABLE" = "green",
+  "FED BQ/ST TAX-EXEMPT" = "purple",
+  "AMT/ST TAX-EXEMPT" = "orange",
+  "FED TAXABLE" = "pink",
+  "FED TAX-EXEMPT" = "cyan"
+)
+
+California %>%
+  dplyr::select(ID_CUSIP, MUNI_TAX_PROV) %>%
+  distinct() %>%  
+  dplyr::group_by(MUNI_TAX_PROV) %>%
+  dplyr::summarize(count = n()) %>%  
+  dplyr::mutate(MUNI_TAX_PROV = reorder(MUNI_TAX_PROV, -count)) %>% 
+  ggplot(aes(x = MUNI_TAX_PROV, y = count, fill = MUNI_TAX_PROV)) +
+  geom_bar(stat = "identity", color = "black") +  
+  labs(x = "Tax status", y = "Number of bonds") +
+  scale_fill_manual(values = province_colors) +  
+  theme_minimal() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1),  
+    axis.text.x = element_text(angle = 20, hjust = 1, size = 7),  
+    legend.position = "none" 
+  )
+
+
+
+```
+
+#3D scatter Plot for the callable and non-callable Bonds (Fig C.1)
+
+```{r}
+
+California$Date <- as.Date(California$Date)
+
+custom_colors <- c(
+  "Callable" = "darkgreen",
+  "Non-Callable" = "purple"
+)
+
+California %>%
+  filter(Date >= "2022-01-01", Date <= "2022-05-31", yield < 6) %>%
+  mutate(CALLABLE = factor(CALLABLE, levels = c("Non-Callable", "Callable"))) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~CALLABLE,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+```
+
+
+#3D scatter Plot for the callable and non-callable Bonds entire period (Fig C.1)
+```{r}
+
+California$Date <- as.Date(California$Date)
+
+custom_colors <- c(
+  "Callable" = "darkgreen",
+  "Non-callable" = "purple"
+)
+
+California %>%
+  filter(Date >= "2020-01-01",  yield < 6, yield >0) %>%
+  mutate(CALLABLE = factor(CALLABLE, levels = c("Non-callable", "Callable"))) %>%
+  arrange(YF, ) %>%  
+  plot_ly(
+    x = ~YF,  
+    y = ~Date,
+    z = ~yield,
+    color = ~CALLABLE,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+```
+
+
+
+
+
+California 3D scatterplot color coded for Tax Province (Fig C.4)
+```{r}
+
+custom_colors <- c(
+  "FED & ST TAX-EXEMPT" = "blue",
+  "FED TAXABLE/ST TAX-EXEMPT" = "red",
+  "FED TAXABLE/ST TAXABLE" = "green",
+  "FED BQ/ST TAXABLE" = "purple",
+  "FED TAXABLE" = "orange",
+  "AMT/ST TAX-EXEMPT" = "pink",
+  "FED BQ/ST TAX-EXEMPT" = "brown",
+  "FED TAX-EXEMPT/ST TAXABLE" = "cyan",
+  "FED TAX-EXEMPT" = "magenta",
+  "AMT/ST TAXABLE" = "gray",
+  "FED BQ" = "darkgreen",
+  "FED AMT FOR INDIVIDUALS" = "darkblue"
+)
+
+California %>%
+  filter(Date >= "2022-05-01", Date <= "2022-05-31", yield < 6) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~MUNI_TAX_PROV,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  # Adjust the size of the points as needed
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+
+```
+
+
+
+
+Coupon Rate hist in California for Callable Bonds using final dataset(Fig C.3)
+```{r}
+California %>%
+  filter( CALLABLE == "Callable") %>%
+  distinct(ID_CUSIP, .keep_all = TRUE) %>%  
+  ggplot(aes(x = CPN)) +
+  geom_histogram(binwidth = 1, fill = "darkgreen", color = "black", alpha = 0.7) +  
+  labs(
+    #title = "Distribution of Coupon Rates for Callable Bonds in California",
+    x = "Coupon Rate",
+    y = "Frequency (Callable)"
+  ) +
+  theme_minimal() + coord_cartesian(xlim = c(0, 9),ylim = c(0,800)) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1)  
+  )
+
+
+
+#Coupon Rate Distribution in California for Callable Bonds
+
+California %>%
+  filter( CALLABLE == "Non-Callable") %>%
+  distinct(ID_CUSIP, .keep_all = TRUE) %>%  
+  ggplot(aes(x = CPN)) +
+  geom_histogram(binwidth = 1, fill = "purple", color = "black", alpha = 0.7) +  
+  labs(
+    #title = "Distribution of Coupon Rates for Callable Bonds in California",
+    x = "Coupon Rate",
+    y = "Frequency (Non-Callable)"
+  ) +
+  theme_minimal() + coord_cartesian(xlim = c(0, 9), ylim = c(0,800)) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1)  
+  )
+
+
+```
+partitions 3D scatterplot color coded for Tax Province (C.5)
+```{r}
+
+custom_colors <- c(
+  "FED & ST TAX-EXEMPT" = "blue",
+  "FED TAXABLE/ST TAX-EXEMPT" = "red",
+  "FED TAXABLE/ST TAXABLE" = "green",
+  "FED BQ/ST TAXABLE" = "purple",
+  "FED TAXABLE" = "orange",
+  "AMT/ST TAX-EXEMPT" = "pink",
+  "FED BQ/ST TAX-EXEMPT" = "brown",
+  "FED TAX-EXEMPT/ST TAXABLE" = "cyan",
+  "FED TAX-EXEMPT" = "magenta",
+  "AMT/ST TAXABLE" = "gray",
+  "FED BQ" = "darkgreen",
+  "FED AMT FOR INDIVIDUALS" = "darkblue"
+)
+
+Cal_callable %>%
+  filter(CPN_range == "5_8.5(%)",MUNI_TAX_PROV %in% c("FED & ST TAX-EXEMPT","FED TAXABLE/ST TAX-EXEMPT"), Date >= "2022-05-01", Date <= "2022-05-31", yield < 6) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~MUNI_TAX_PROV,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10), range = c(0, 40)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+
+```
+
+
+
+#Curve Fitting for a specific day to test the goodness of fit (Fig 1)
+
+```{r}
+
+# Function to create fitted plot for a given dataset
+create_fitted_plot <- function(dataset, dataset_name, date = "2022-05-23") {
+  
+  if(!exists(deparse(substitute(dataset))) || is.null(dataset)) {
+    cat("Dataset", dataset_name, "does not exist or is NULL\n")
+    return(NULL)
+  }
+  
+  date_data <- dataset[dataset$Date == date, ]
+  if(nrow(date_data) == 0) {
+    cat("No data found for", dataset_name, "on", date, "\n")
+    return(NULL)
+  }
+  
+  m1 <- 1
+  terms <- sort(rep(c(30,20,10,7,6,3,2,1,0.5,0.25,0.1), 1))
+  
+  x <- date_data$YF
+  y <- date_data$yield
+  
+  if(length(x) < 3) {
+    cat("Insufficient data points for", dataset_name, "on", date, "\n")
+    return(NULL)
+  }
+  
+  cuts <- summary(x)[c(2,3,5)]
+  
+  spline_fit <- lm(y ~ bs(x, degree = m1, knots = cuts))
+  pred <- predict(spline_fit, newdata = data.frame(x = terms), se.fit = TRUE)
+  se <- qnorm((1 + 0.95) / 2) * pred$se.fit
+  
+  plot(x, y, 
+       xlab = "Terms (annualized)", 
+       ylab = "Yield (%)", 
+       xlim = c(0,30), 
+       ylim = c(0,9))
+  
+  lines(terms, pred$fit, col = "red")
+  lines(terms, pred$fit + se, col = "orange", lty = 2)
+  lines(terms, pred$fit - se, col = "orange", lty = 2)
+  
+  legend("bottomright", 
+         legend = c("Smoothed Fit", paste(95, "% Confidence Intervals")),
+         col = c("red", "orange"), 
+         lty = c(1, 2), 
+         pch = c(NA, NA), 
+         lwd = c(2, 1), 
+         cex = 0.7)
+  
+  abline(v = cuts, col = "grey", lty = "dashed")
+}
+
+# List of all datasets
+dataset_list <- list(
+  "G1_nc_all" = G1_nc_all,
+  "G2_nc_op" = G2_nc_op,
+  "G2_nc_ft" = G2_nc_ft,
+  "G3_nc_all" = G3_nc_all,
+  "G1_c_op" = G1_c_op,
+  "G1_c_ft" = G1_c_ft,
+  "G2_c_op" = G2_c_op,
+  "G2_c_ft" = G2_c_ft,
+  "G3_c_all" = G3_c_all
+)
+
+D <- "2022-05-23"
+
+for(i in 1:length(dataset_list)) {
+  dataset_name <- names(dataset_list)[i]
+  dataset <- dataset_list[[i]]
+  
+  create_fitted_plot(dataset, dataset_name, D)
+}
+
+```
+
+
+
+
+California 3D scatterplot color coded for Tax Province 20-24 (Fig ) (change the province for other plots)
+```{r}
+
+custom_colors <- c(
+  "FED & ST TAX-EXEMPT" = "blue",
+  "FED TAXABLE/ST TAX-EXEMPT" = "red",
+  "FED TAXABLE/ST TAXABLE" = "green",
+  "FED BQ/ST TAXABLE" = "purple",
+  "FED TAXABLE" = "orange",
+  "AMT/ST TAX-EXEMPT" = "pink",
+  "FED BQ/ST TAX-EXEMPT" = "brown",
+  "FED TAX-EXEMPT/ST TAXABLE" = "cyan",
+  "FED TAX-EXEMPT" = "magenta",
+  "AMT/ST TAXABLE" = "gray",
+  "FED BQ" = "darkgreen",
+  "FED AMT FOR INDIVIDUALS" = "darkblue"
+)
+
+California %>%
+  filter(Date >= "2020-01-01" , yield < 6, yield>0) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~MUNI_TAX_PROV,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+
+```
+
+
+partitions 3D scatterplot color coded for Tax Province (Fig C.5) (change the province for other plots)
+```{r}
+
+custom_colors <- c(
+  "FED & ST TAX-EXEMPT" = "blue",
+  "FED TAXABLE/ST TAX-EXEMPT" = "red",
+  "FED TAXABLE/ST TAXABLE" = "green",
+  "FED BQ/ST TAXABLE" = "purple",
+  "FED TAXABLE" = "orange",
+  "AMT/ST TAX-EXEMPT" = "pink",
+  "FED BQ/ST TAX-EXEMPT" = "brown",
+  "FED TAX-EXEMPT/ST TAXABLE" = "cyan",
+  "FED TAX-EXEMPT" = "magenta",
+  "AMT/ST TAXABLE" = "gray",
+  "FED BQ" = "darkgreen",
+  "FED AMT FOR INDIVIDUALS" = "darkblue"
+)
+
+Cal_non_callable %>%
+  filter(CPN_Group == "CPN_5_8", Date >= "2022-05-01", Date <= "2022-05-31", yield < 6) %>%
+  plot_ly(
+    x = ~YF,
+    y = ~Date,
+    z = ~yield,
+    color = ~MUNI_TAX_PROV,
+    colors = custom_colors,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 3)  
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Term (Year)", title_font = list(size = 12), tickfont = list(size = 10), range = c(0, 40)),
+      yaxis = list(title = "Date", title_font = list(size = 12), tickfont = list(size = 10)),
+      zaxis = list(title = "Yield (%)", title_font = list(size = 12), tickfont = list(size = 10))
+    )
+  )
+
+
+
+
+```
+
+
+ plots color coded for partitions in day t
+

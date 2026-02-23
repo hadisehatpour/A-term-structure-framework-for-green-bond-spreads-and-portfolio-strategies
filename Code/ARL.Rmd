@@ -1,0 +1,1333 @@
+---
+title: "ARL"
+author: "Hadi"
+output: html_document
+---
+
+
+Library
+```{r}
+library(arules)
+library(arulesViz)
+library(knitr)
+library(plyr)
+library(dplyr)
+library(RColorBrewer)
+library(stringr)
+library(quantmod)
+library(splines2)
+library(splines)
+library(mgcv)
+library(RQuantLib)
+library(tidyr)
+library(xts)
+library(plotly)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(scatterplot3d)
+library(tidyverse)
+library(zoo)
+library(plotly)
+library(writexl)
+library(YieldCurve)
+library(patchwork)
+library(gridExtra)
+library(stargazer)
+library(scales)
+library(pdfetch)
+library(xtable)
+```
+
+
+```{r}
+
+
+California <- readRDS('...')
+MLFeat <- read_xlsx('...')
+
+
+```
+
+
+```{r}
+
+
+California <- California %>% 
+  mutate(month = paste0(month.abb[month(Date)], substr(year(Date), 3, 4)))
+
+```
+
+
+
+```{r}
+#Adding median of S2 to by year and bonds
+ARL <- California %>% group_by(ID_CUSIP, year, month) %>% 
+  dplyr::summarise(Med_m_S2 = median(S2))
+
+```
+
+
+```{r}
+
+#Labeling Spread based on their sign
+
+ARL$Med_m_SL <- 0
+
+
+#Median
+
+for (i in 1:nrow(ARL)){
+  if (ARL$Med_m_S2[i] > 0){
+    ARL$Med_m_SL[i] <- "S+"
+  } else if (ARL$Med_m_S2[i] < 0){
+    ARL$Med_m_SL[i] <- "S-"
+  } else if (ARL$Med_m_S2[i] == 0){
+    ARL$Med_m_SL[i] <- "S0"
+  }
+} 
+
+
+```
+
+
+Adding features
+```{r}
+ARL <- merge(ARL, MLFeat, by = "ID_CUSIP")
+
+```
+
+
+labeling numerical features
+```{r}
+
+#replace labels  for Callability
+
+for (i in 1:nrow(ARL)) {
+  if (ARL$CALLABLE[i] == "FALSE") {
+    ARL$CALLABLE[i] <- "Non-callable"
+  } else {
+    ARL$CALLABLE[i] <- "Callable"
+  }
+}
+
+
+
+
+#SELF_REPRTD_GREEN_INSTR_INDCTR
+
+ARL$SELF_REPRTD_GREEN_INSTR_INDCTR[ARL$SELF_REPRTD_GREEN_INSTR_INDCTR == "TRUE"]<-
+  "YES"
+
+#Coupon rate
+cpn_intervals <- cut(ARL$CPN, breaks = c(0, 2.99, 4.999, 15), labels = c("0_3(%)", "3_5(%)", "5_8.5(%)"))
+
+ARL <- ARL %>% mutate(CPN_Group = cpn_intervals)
+
+#SPREAD_AT_ISSUANCE_TO_WORST
+Sp_at_iss_intervals <- cut(ARL$SPREAD_AT_ISSUANCE_TO_WORST,
+                           breaks = c(quantile(ARL$SPREAD_AT_ISSUANCE_TO_WORST, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 17", "17_57", "57_100", "Higher than 100"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(S_AT_Iss = Sp_at_iss_intervals)
+
+
+#DUR_ADJ_MID
+DUR_ADJ_MID_intervals <- cut(ARL$DUR_ADJ_MID,
+                           breaks = c(quantile(ARL$DUR_ADJ_MID, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c(" Less than 2.8", "2.8_4.8", "4.8_7", "Higher than 7"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(DAM = DUR_ADJ_MID_intervals)
+
+
+
+#DUR_MID
+DUR_MID_intervals <- cut(ARL$DUR_MID,
+                           breaks = c(quantile(ARL$DUR_MID, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 2.9", "2.9_4.9", "4.9_7.3", " Higher than 7.3"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(DM = DUR_MID_intervals)
+
+
+
+#	YIELD_ON_ISSUE_DATE
+Y_on_Iss_Date_intervals <- cut(ARL$YIELD_ON_ISSUE_DATE,
+                           breaks = c(quantile(ARL$YIELD_ON_ISSUE_DATE, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c(" Less than 1.7", "1.7_2.4", "2.4_3.2", "Higher than 3.2"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(Y_OID = Y_on_Iss_Date_intervals)
+
+
+
+
+#	ISSUE_PX
+
+#1-labeling price at issuance
+
+ARL <- ARL %>%
+  mutate(
+    Iss_pri._spread = case_when(
+      is.na(ISSUE_PX) ~ NA_character_,
+      ISSUE_PX == 100 ~ "At Par",
+      ISSUE_PX < 100 ~ "At Discount",
+      ISSUE_PX > 100 ~ "At Premium"
+    )
+  )
+
+
+#AMT_ISSUED
+ARL$log_AMT_ISSUED <- log(ARL$AMT_ISSUED)
+
+Amt_issued_intervals <- cut(ARL$log_AMT_ISSUED,
+                           breaks = c(quantile(ARL$log_AMT_ISSUED, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 14", "14_15", "15_16", "Higher than 16"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(Amt_iss_int = Amt_issued_intervals)
+
+#MUNI_ISSUE_SIZE
+ARL$log_MUNI_ISSUE_SIZE <- log(ARL$MUNI_ISSUE_SIZE)
+
+MUNI_ISSUE_SIZE_intervals <- cut(ARL$log_MUNI_ISSUE_SIZE,
+                           breaks = c(quantile(ARL$log_MUNI_ISSUE_SIZE, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 17", "17_18.7", "18.7_19.5", "Higher than 19.5"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(MUNI_ISSUE_SIZE_int = MUNI_ISSUE_SIZE_intervals)
+
+
+#SHORT_AND_LONG_TERM_DEBT
+ARL$Log_DEBT <- log(ARL$SHORT_AND_LONG_TERM_DEBT)
+
+Debt_intervals <- cut(ARL$Log_DEBT,
+                           breaks = c(quantile(ARL$Log_DEBT, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 5", "5-6.5", "6.5_8", "Higher than 8"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(S_L_DEBT = Debt_intervals)
+
+
+#8.	SALES_REV_TURN
+ARL$Log_Sale_Turn <- log(ARL$SALES_REV_TURN)
+
+Sale_intervals <- cut(ARL$Log_Sale_Turn,
+                           breaks = c(quantile(ARL$Log_Sale_Turn, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c("Less than 3.5", "3.5-4.6", "4.6_6.5", "Higher than 8.5"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(SALES_REV_TURN_int = Sale_intervals)
+
+
+
+#MTY-YEARS
+
+MTY_YEARS_intervals <- cut(ARL$`MTY-YEARS`,
+                           breaks = c(quantile(ARL$`MTY-YEARS`, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c(" Less than 8", "8_12.3", "12.3_17", "Higher than 17"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(MTY_YEARS_int = MTY_YEARS_intervals)
+
+#ISSUE_DT and Maturity
+ARL$Y_l_day <- as.Date(paste(ARL$year, "-12-31", sep = ""), format = "%Y-%m-%d")
+
+
+for (i in 1:nrow(ARL)){
+  ARL$Active_years[i] <- yearFraction(ymd(ARL$ISSUE_DT[i]) 
+                                   , ymd(ARL$Y_l_day[i]), dayCounters = 12)
+  ARL$years_to_maturity[i] <- yearFraction(ymd(ARL$Y_l_day[i]) 
+                                   , ymd(ARL$MATURITY[i]), dayCounters = 12)
+  
+}
+
+active_years_interval <- cut(ARL$Active_years,
+                           breaks = c(quantile(ARL$Active_years, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c(" Less than 1.1", "1.1_2.3", "2.3_4.1", "Higher than 4.1"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(Active_years_int = active_years_interval)
+
+
+years_to_maturity_interval <- cut(ARL$years_to_maturity,
+                           breaks = c(quantile(ARL$years_to_maturity, na.rm = TRUE)), na.rm = TRUE,
+                           labels =  c(" Less than 4.7", "4.7_9.4", "9.4_14.4", "Higher than 14.4"), include.lowest = TRUE)
+
+ARL <- ARL %>% mutate(years_to_maturity_int = years_to_maturity_interval)
+
+
+saveRDS(ARL, "...")
+
+```
+
+label missing with char "NA"
+```{r}
+
+
+ARL$BB_COMPOSITE[is.na(ARL$BB_COMPOSITE)] <- "Not_Rated"
+ARL$SELF_REPRTD_GREEN_INSTR_INDCTR[is.na(ARL$SELF_REPRTD_GREEN_INSTR_INDCTR)] <- "Not labelled"
+ARL$RTG_FITCH[is.na(ARL$RTG_FITCH)] <- "Not_Rated"
+ARL$RTG_FITCH_LONG[is.na(ARL$RTG_FITCH_LONG)] <- "Not_Rated"
+ARL$S_AT_Iss <- as.character(ARL$S_AT_Iss)
+ARL$S_AT_Iss[is.na(ARL$S_AT_Iss)] <- "NA"
+ARL$S_AT_Iss <- as.character(ARL$S_AT_Iss)
+ARL$S_AT_Iss[is.na(ARL$S_AT_Iss)] <- "NA"
+ARL$DAM <- as.character(ARL$DAM)
+ARL$DAM[is.na(ARL$DAM)] <- "NA"
+ARL$DM <- as.character(ARL$DM)
+ARL$DM[is.na(ARL$DM)] <- "NA"
+ARL$Y_OID <- as.character(ARL$Y_OID)
+ARL$Y_OID[is.na(ARL$Y_OID)] <- "NA"
+ARL$Iss_pri._spread <- as.character(ARL$Iss_pri._spread)
+ARL$Iss_pri._spread[is.na(ARL$Iss_pri._spread)] <- "NA"
+ARL$Amt_iss_int <- as.character(ARL$Amt_iss_int)
+ARL$Amt_iss_int[is.na(ARL$Amt_iss_int)] <- "NA"
+ARL$MUNI_ISSUE_SIZE_int <- as.character(ARL$MUNI_ISSUE_SIZE_int)
+ARL$MUNI_ISSUE_SIZE_int[is.na(ARL$MUNI_ISSUE_SIZE_int)] <- "NA"
+ARL$MTY_YEARS_int <- as.character(ARL$MTY_YEARS_int)
+ARL$MTY_YEARS_int[is.na(ARL$MTY_YEARS_int)] <- "NA"
+ARL$Active_years_int <- as.character(ARL$Active_years_int)
+ARL$Active_years_int[is.na(ARL$Active_years_int)] <- "NA"
+ARL$years_to_maturity_int <- as.character(ARL$years_to_maturity_int)
+ARL$years_to_maturity_int[is.na(ARL$years_to_maturity_int)] <- "NA"
+ARL$S_L_DEBT <- as.character(ARL$S_L_DEBT)
+ARL$S_L_DEBT[is.na(ARL$S_L_DEBT)] <- "NA"
+ARL$SALES_REV_TURN_int <- as.character(ARL$SALES_REV_TURN_int)
+ARL$SALES_REV_TURN_int[is.na(ARL$SALES_REV_TURN_int)] <- "NA"
+
+```
+
+
+Add prefix for features
+```{r}
+ARL$BB_COMPOSITE <- paste("BB_rating", ARL$BB_COMPOSITE, sep = " : ")
+
+ARL$MUNI_TAX_PROV <- paste("Tax", ARL$MUNI_TAX_PROV, sep = " : ")
+
+ARL$CPN_TYP <- paste("CPN TYP", ARL$CPN_TYP, sep = " : ")
+
+ARL$CPN_Group <- paste("CPN", ARL$CPN_Group, sep = " : ")
+
+ARL$MARKET_ISSUE <- paste("Market", ARL$MARKET_ISSUE, sep = " : ")
+
+ARL$CALLABLE <- paste("Call", ARL$CALLABLE, sep = " : ")
+
+ARL$MUNI_PURPOSE <- paste("UOP", ARL$MUNI_PURPOSE, sep = " : ")
+
+ARL$FINANCING_TYPE <- paste("FIN. TYP", ARL$FINANCING_TYPE, sep = " : ")
+
+ARL$ISSUER_BULK <- paste("Issuer Name", ARL$ISSUER_BULK, sep = " : ")
+
+ARL$MUNI_LONG_INDUSTRY_TYP <- paste("Issuer Sector", 
+                                         ARL$MUNI_LONG_INDUSTRY_TYP, sep = " : ")
+ARL$RTG_FITCH_LONG <- paste("RTG Long Rating", 
+                                         ARL$RTG_FITCH_LONG, sep = " : ")
+ARL$RTG_FITCH <- paste("RTG Rating", 
+                                         ARL$RTG_FITCH, sep = " : ")
+ARL$S_AT_Iss <- paste("S OID", 
+                                         ARL$S_AT_Iss, sep = " : ")
+ARL$DAM <- paste("DU_Adj_MID", 
+                                         ARL$DAM, sep = " : ")
+ARL$DM <- paste("DU_MID", 
+                                         ARL$DM, sep = " : ")
+ARL$Y_OID <- paste("Y_OID", 
+                                         ARL$Y_OID, sep = " : ")
+
+ARL$Iss_pri._spread <- paste("Pricing TYP", 
+                                         ARL$Iss_pri._spread, sep = " : ")
+
+ARL$Amt_iss_int <- paste("Issued Amt", 
+                                         ARL$Amt_iss_int, sep = " : ")
+
+ARL$MUNI_ISSUE_SIZE_int <- paste("Muni Issued Size", 
+                                         ARL$MUNI_ISSUE_SIZE_int, sep = " : ")
+
+ARL$MTY_YEARS_int <- paste("Maturity OID", 
+                                         ARL$MTY_YEARS_int, sep = " : ")
+ARL$SELF_REPRTD_GREEN_INSTR_INDCTR <- 
+  paste("Self Rep. Gr.",  ARL$SELF_REPRTD_GREEN_INSTR_INDCTR, sep = " : ")
+
+ARL$S_L_DEBT <- paste("Debt",  ARL$S_L_DEBT, sep = " : ")
+
+ARL$SALES_REV_TURN_int <- paste("SALES REV",  ARL$SALES_REV_TURN_int, sep = " : ")
+
+ARL$Active_years_int <- paste("Active years",  ARL$Active_years_int, sep = " : ")
+
+ARL$years_to_maturity_int <- paste("R Ys to Maturity",  ARL$years_to_maturity_int, sep = " : ")
+```
+
+
+Remove redundant features
+```{r}
+
+ARL_final_feat <- 
+  ARL %>% filter(year >= 2016) %>% 
+  select(
+    -any_of(
+      c(
+        "CPN_TYP", "CRNCY", "MAKE_WHOLE_CALL_TYPE", "MUNI_FORM", "SUPER_SINKER",
+        "ID_CUSIP", "Mea_S2", "Mea_SL", "CPN", "CPN_FREQ",
+        "ISSUE_DT", "MATURITY",
+        "SPREAD_AT_ISSUANCE_TO_WORST", "DUR_ADJ_MID", 
+        "DUR_MID", "ISSUE_PX", "YIELD_ON_ISSUE_DATE", "AMT_ISSUED",
+        "MUNI_ISSUE_SIZE", "IS_SUBORDINATED", 
+        "SALES_REV_TURN", "log_AMT_ISSUED", "log_MUNI_ISSUE_SIZE",
+        "SHORT_AND_LONG_TERM_DEBT", "MTY-YEARS", "State Code", "Region", "Y_l_day",
+        "Active_years", "years_to_maturity", "Log_DEBT", "Log_Sale_Turn", "S_L_DEBT",
+        "SALES_REV_TURN_int", "RTG_FITCH_LONG", "RTG_FITCH", "DM", "Med_m_S2"
+      )
+    )
+  )
+
+
+```
+
+```{r}
+
+saveRDS(ARL, "...")
+saveRDS(ARL_final_feat, "...")
+
+```
+
+subset dataset for each year
+```{r}
+
+ARL_total <- ARL_final_feat %>% select(!c(year,month))
+
+#Remove missing values
+ARL_total <- ARL_total[complete.cases(ARL_total),]
+
+#Convert all features to factors
+ARL_total <-ARL_total %>%  mutate_all(as.factor)
+
+
+#convert dataframe to transaction format
+Caltottr <- ARL_total %>%
+  unite(item, everything(), sep = ",")
+
+write.csv(Caltottr, "~/Library/CloudStorage/OneDrive-Personal/PhD/1st project/2nd paper/Data/Caltottr.csv", quote = FALSE, row.names = FALSE)
+
+
+#Import transaction file
+
+trtot <- read.transactions("~/Library/CloudStorage/OneDrive-Personal/PhD/1st project/2nd paper/Data/Caltottr.csv", format = "basket", sep = ",")
+
+```
+
+Summary of transactions
+```{r}
+
+summary (Caltottr)
+summary (tr2023)
+
+```
+
+
+Absolute Item Frequency Plot
+```{r}
+itemFrequencyPlot(trtot, topN = 20, type = "absolute", col = brewer.pal(8,'Pastel2'), main="Absolute Item Frequency Plot")
+
+```
+
+Relative Item Frequency Plot
+```{r}
+itemFrequencyPlot(Caltottr, topN = 20, type = "relative", col = brewer.pal(8,'Pastel2'), main="Relative Item Frequency Plot")
+```
+
+Generating Rules (positive and negative)
+
+```{r}
+
+PP.association.rules <- apriori(trtot, parameter = list(supp=0.001, conf=0.001, maxlen=10),appearance = list(default="lhs",rhs="S+"))
+
+NP.association.rules <- apriori(trtot, parameter = list(supp=0.001, conf=0.001, maxlen=10),appearance = list(default="lhs",rhs="S-"))
+
+
+#Add supp_conf measure
+
+
+#Positive itemsets
+Pquality_scores <- quality(PP.association.rules)
+
+Psupp_conf <- Pquality_scores$support * Pquality_scores$confidence
+
+slot(PP.association.rules, "quality")$supp_conf <- Psupp_conf
+ 
+#Negative itemsets
+Nquality_scores <- quality(NP.association.rules)
+
+Nsupp_conf <- Nquality_scores$support * Nquality_scores$confidence
+
+slot(NP.association.rules, "quality")$supp_conf <- Nsupp_conf
+
+
+
+
+
+```
+
+Rules scatterplots
+```{r}
+plot(PP.association.rules, jitter = 0)
+
+```
+
+
+Table (E.2)
+```{r}
+library(xtable)
+
+# Extract summary statistics
+pp_summary <- summary(quality(PP.association.rules)$confidence)
+np_summary <- summary(quality(NP.association.rules)$confidence)
+
+# Combine into a data frame
+summary_df <- data.frame(
+  Statistic = names(pp_summary),
+  PP_Rules = as.numeric(pp_summary),
+  NP_Rules = as.numeric(np_summary)
+)
+
+# Generate LaTeX table
+xtable(summary_df, caption = "Summary Statistics of Confidence for Association Rules", 
+       label = "tab:confidence_summary")
+
+```
+
+
+
+First order rules
+```{r}
+PsubRules_Order2 <- PP.association.rules[quality(PP.association.rules)$confidence > 0.49 & quality(PP.association.rules)$support > 0.1 & size(PP.association.rules) == 2 ]
+
+NsubRules_Order2 <- NP.association.rules[quality(NP.association.rules)$confidence > 0.53 & quality(NP.association.rules)$support > 0.1 & size(NP.association.rules) == 2 ]
+
+
+```
+
+
+rules inspection and plots
+```{r}
+inspect(head(PsubRules_Order2, n = 10, by = "confidence"))
+
+plot((head(PsubRules_Order2, n = 10, by = "confidence")), method = "paracoord", measure = "confidence", shading = "lift")
+
+```
+
+
+
+
+rules inspection (ranked by confidence)
+```{r}
+NP_O2 <- c(PsubRules_Order2,NsubRules_Order2)
+
+inspect(head(PsubRules_Order2, n = 20, by = "confidence"))
+
+inspect(head(NsubRules_Order2, n = 20, by = "confidence"))
+
+
+
+#selecting and combining top 15 rules for the table
+
+Ptop15subRules <- head(PsubRules_Order2, n = 15, by = "confidence")
+
+Ntop15subRules <- head(NsubRules_Order2, n = 15, by = "confidence")
+
+NP15_O2 <- c(Ntop15subRules, Ptop15subRules)
+
+
+
+xtable(inspect(NP15_O2), digits = 4)
+
+
+Ptop10subRules <- head(PsubRules_Order2, n = 10, by = "confidence")
+
+Ntop10subRules <- head(NsubRules_Order2, n = 10, by = "confidence")
+
+NP10_O2 <- c(Ntop10subRules, Ptop10subRules)
+
+
+```
+
+
+```{r}
+plot(NP10_O2, method = "grouped", measure = "confidence", shading = "support")
+
+```
+
+Second order rules (nesting first order rules)
+
+Filter rules  for positive 
+```{r}
+
+# Extract LHS rules and use them directly in the filter
+nested_rules_P <- unique(unlist(LIST(lhs(Ptop15subRules))))
+
+lhs_rules <- unique(unlist(LIST(lhs(Ptop15subRules))))
+
+PsubRules_Order3 <- PP.association.rules[
+  quality(PP.association.rules)$confidence > 0.49 & 
+  quality(PP.association.rules)$support > 0.1 & 
+  size(PP.association.rules) == 3 & 
+  lhs(PP.association.rules) %in% nested_rules_P
+]
+
+
+# Extract LHS for negative rules
+nested_rules_N <- unique(unlist(LIST(lhs(Ntop15subRules))))
+
+NsubRules_Order3 <- NP.association.rules[quality(NP.association.rules)$confidence > 0.53 & quality(NP.association.rules)$support > 0.1 & size(NP.association.rules) == 3 & lhs(NP.association.rules) %in% nested_rules_N]
+
+
+
+Ptop10subRules3 <- head(PsubRules_Order3, n = 10, by = "confidence")
+Ntop10subRules3 <- head(NsubRules_Order3, n = 10, by = "confidence")
+
+```
+
+
+Nested rules function
+```{r}
+
+filter_rules_by_order <- function(top_rules, all_rules, rule_order, confidence_limit, support_limit) {
+  # Extract the LHS itemsets from top_rules and convert to character vectors
+  nested_rules_list <- lapply(LIST(lhs(top_rules)), function(x) as.character(x))
+  
+  # Create a function to filter rules based on itemsets
+  filter_rules_by_itemset <- function(itemset) {
+    all_rules[
+      quality(all_rules)$confidence > confidence_limit & 
+      quality(all_rules)$support > support_limit & 
+      size(all_rules) == rule_order & 
+      lhs(all_rules) %ain% itemset
+    ]
+  }
+  
+  # Apply the function to each nested rule and combine results
+  filtered_rules_list <- lapply(nested_rules_list, filter_rules_by_itemset)
+  
+  # Combine all results
+  combined_rules <- unique(do.call(c, filtered_rules_list))
+  
+  return(combined_rules)
+}
+
+
+```
+
+
+Nested rules
+```{r}
+
+# Positive
+# Initialize the first rule set
+PsubRules_list <- list()
+PsubRules_list[[3]] <- PsubRules_Order3  # Starting with order 3
+
+# Loop through orders 4 to 7
+for(i in 4:6) {
+  # Get top 10 rules from previous order by confidence
+  top_10_rules <- head(PsubRules_list[[i-1]][order(quality(PsubRules_list[[i-1]])$confidence, decreasing = TRUE)], 10)
+  
+  PsubRules_list[[i]] <- filter_rules_by_order(
+    top_rules = top_10_rules,
+    all_rules = PP.association.rules,
+    rule_order = i,
+    confidence_limit = 0.49,
+    support_limit = 0.1
+  )
+}
+
+# Negative
+# Initialize the first rule set
+NsubRules_list <- list()
+NsubRules_list[[3]] <- NsubRules_Order3  # Starting with order 3
+
+# Loop through orders 4 to 7
+for(i in 4:6) {
+  # Get top 10 rules from previous order by confidence
+  top_10_rules <- head(NsubRules_list[[i-1]][order(quality(NsubRules_list[[i-1]])$confidence, decreasing = TRUE)], 10)
+  
+  NsubRules_list[[i]] <- filter_rules_by_order(
+    top_rules = top_10_rules,
+    all_rules = NP.association.rules,
+    rule_order = i,
+    confidence_limit = 0.53,
+    support_limit = 0.1
+  )
+}
+
+
+
+```
+
+
+
+
+Overleaf table for nested rules (Table G.1)
+
+```{r}
+
+
+# Create LaTeX tables for nested rules
+library(xtable)
+
+# Function to create a clean table for top 5 rules
+create_rules_table <- function(rules_set, order_num, spread_type) {
+  if(length(rules_set) == 0) {
+    return(paste("No rules found for Order", order_num, spread_type))
+  }
+  
+  # Sort by confidence and take top 5
+  sorted_rules <- sort(rules_set, by = "confidence", decreasing = TRUE)
+  top5_rules <- sorted_rules[1:min(5, length(sorted_rules))]
+  
+  # Extract rule information
+  rules_df <- data.frame(
+    LHS = labels(lhs(top5_rules)),
+    RHS = labels(rhs(top5_rules)),
+    Support = round(quality(top5_rules)$support, 3),
+    Confidence = round(quality(top5_rules)$confidence, 3),
+    Lift = round(quality(top5_rules)$lift, 3)
+  )
+  
+  # Clean up LHS by removing curly braces and quotes
+  rules_df$LHS <- gsub("\\{|\\}", "", rules_df$LHS)
+  rules_df$LHS <- gsub('"', '', rules_df$LHS)
+  
+  # Create table caption
+  caption <- paste("Top 5", spread_type, "Spread Rules - Order", order_num)
+  label <- paste0("tab:", tolower(spread_type), "_order", order_num)
+  
+  # Generate LaTeX table
+  xtable_obj <- xtable(rules_df, 
+                      caption = caption,
+                      label = label,
+                      align = c("l", "p{6cm}", "c", "c", "c", "c"), digits = 4)
+  
+  return(print(xtable_obj, 
+               include.rownames = FALSE,
+               caption.placement = "top",
+               table.placement = "htbp",
+               scalebox = 0.8))
+}
+
+# Generate tables for each order and spread type
+
+# POSITIVE SPREAD TABLES
+cat("% POSITIVE SPREAD RULES TABLES\n")
+cat("% =============================\n\n")
+
+# Order 2 Positive
+if(exists("PsubRules_Order2")) {
+  cat("% Order 2 Positive Rules\n")
+  create_rules_table(PsubRules_Order2, 2, "Positive")
+  cat("\n")
+}
+
+# Order 3 Positive  
+if(exists("PsubRules_Order3")) {
+  cat("% Order 3 Positive Rules\n")
+  create_rules_table(PsubRules_Order3, 3, "Positive")
+  cat("\n")
+}
+
+# Order 4 Positive
+if(exists("PsubRules_list") && length(PsubRules_list) >= 4) {
+  cat("% Order 4 Positive Rules\n")
+  create_rules_table(PsubRules_list[[4]], 4, "Positive")
+  cat("\n")
+}
+
+# Order 5 Positive
+if(exists("PsubRules_list") && length(PsubRules_list) >= 5) {
+  cat("% Order 5 Positive Rules\n")
+  create_rules_table(PsubRules_list[[5]], 5, "Positive")
+  cat("\n")
+}
+
+cat("\n\\clearpage\n\n")
+
+# NEGATIVE SPREAD TABLES
+cat("% NEGATIVE SPREAD RULES TABLES\n")
+cat("% ==============================\n\n")
+
+# Order 2 Negative
+if(exists("NsubRules_Order2")) {
+  cat("% Order 2 Negative Rules\n")
+  create_rules_table(NsubRules_Order2, 2, "Negative")
+  cat("\n")
+}
+
+# Order 3 Negative
+if(exists("NsubRules_Order3")) {
+  cat("% Order 3 Negative Rules\n")
+  create_rules_table(NsubRules_Order3, 3, "Negative")
+  cat("\n")
+}
+
+# Order 4 Negative
+if(exists("NsubRules_list") && length(NsubRules_list) >= 4) {
+  cat("% Order 4 Negative Rules\n")
+  create_rules_table(NsubRules_list[[4]], 4, "Negative")
+  cat("\n")
+}
+
+# Order 5 Negative
+if(exists("NsubRules_list") && length(NsubRules_list) >= 5) {
+  cat("% Order 5 Negative Rules\n")
+  create_rules_table(NsubRules_list[[5]], 5, "Negative")
+  cat("\n")
+}
+
+
+```
+
+
+
+
+```{r}
+
+# NEGATIVE RULES - Top 5 for each order (2-6)
+# Using: support > 0.1, confidence > 0.53
+cat("\n=== NEGATIVE RULES ===\n\n")
+
+for(order in 2:6) {
+  cat(paste0("\n--- Order ", order, " Negative Rules ---\n"))
+  
+  neg_rules <- NP.association.rules[
+    quality(NP.association.rules)$confidence > 0.53 & 
+    quality(NP.association.rules)$support > 0.1 & 
+    size(NP.association.rules) == order
+  ]
+  
+  top5_neg <- head(sort(neg_rules, by = "confidence", decreasing = TRUE), 5)
+  
+  if(length(top5_neg) > 0) {
+    inspect(top5_neg)
+  } else {
+    cat("No rules found\n")
+  }
+}
+
+# POSITIVE RULES - Top 5 for each order (2-6)
+# Using: support > 0.1, confidence > 0.49
+cat("\n\n=== POSITIVE RULES ===\n\n")
+
+for(order in 2:6) {
+  cat(paste0("\n--- Order ", order, " Positive Rules ---\n"))
+  
+  pos_rules <- PP.association.rules[
+    quality(PP.association.rules)$confidence > 0.49 & 
+    quality(PP.association.rules)$support > 0.1 & 
+    size(PP.association.rules) == order
+  ]
+  
+  top5_pos <- head(sort(pos_rules, by = "confidence", decreasing = TRUE), 5)
+  
+  if(length(top5_pos) > 0) {
+    inspect(top5_pos)
+  } else {
+    cat("No rules found\n")
+  }
+}
+```
+
+Table (G.2)
+```{r}
+# Function to create xtable for rules
+create_latex_table <- function(rules, order_num, rule_type) {
+  if(length(rules) == 0) {
+    return(cat(paste0("% No ", rule_type, " rules for order ", order_num, "\n\n")))
+  }
+  
+  # Get top 5 rules
+  top5 <- head(sort(rules, by = "confidence", decreasing = TRUE), 5)
+  
+  # Create dataframe
+  df <- data.frame(
+    LHS = gsub("[{}\"']", "", labels(lhs(top5))),
+    RHS = gsub("[{}\"']", "", labels(rhs(top5))),
+    Support = round(quality(top5)$support, 3),
+    Confidence = round(quality(top5)$confidence, 3),
+    Lift = round(quality(top5)$lift, 3)
+  )
+  
+  # Create xtable
+  caption <- paste0("Top 5 ", rule_type, " Rules - Order ", order_num)
+  label <- paste0("tab:", tolower(rule_type), "_order", order_num)
+  
+  xt <- xtable(df, 
+               caption = caption,
+               label = label,
+               align = c("l", "p{5cm}", "c", "c", "c", "c"))
+  
+  print(xt, 
+        include.rownames = FALSE,
+        caption.placement = "top",
+        table.placement = "H",
+        scalebox = 0.85)
+  
+  cat("\n")
+}
+
+# Generate all tables
+cat("% ===========================================\n")
+cat("% NEGATIVE RULES TABLES (Orders 2-6)\n")
+cat("% Support > 0.1, Confidence > 0.53\n")
+cat("% ===========================================\n\n")
+
+for(order in 2:6) {
+  neg_rules <- NP.association.rules[
+    quality(NP.association.rules)$confidence > 0.53 & 
+    quality(NP.association.rules)$support > 0.1 & 
+    size(NP.association.rules) == order
+  ]
+  
+  create_latex_table(neg_rules, order, "Negative")
+}
+
+cat("\n\\clearpage\n\n")
+
+cat("% ===========================================\n")
+cat("% POSITIVE RULES TABLES (Orders 2-6)\n")
+cat("% Support > 0.1, Confidence > 0.49\n")
+cat("% ===========================================\n\n")
+
+for(order in 2:6) {
+  pos_rules <- PP.association.rules[
+    quality(PP.association.rules)$confidence > 0.49 & 
+    quality(PP.association.rules)$support > 0.1 & 
+    size(PP.association.rules) == order
+  ]
+  
+  create_latex_table(pos_rules, order, "Positive")
+}
+```
+
+
+
+Temporal consistency
+```{r}
+
+
+# Consistency section - REVISED
+ARL <- ARL %>% filter(year>=2020)
+
+ARL_final_feat <- 
+  ARL %>% 
+  select(
+    -any_of(
+      c(
+        "CPN_TYP", "CRNCY", "MAKE_WHOLE_CALL_TYPE", "MUNI_FORM", "SUPER_SINKER",
+        "ID_CUSIP", "Mea_S1", "Mea_SL", "CPN", "CPN_FREQ",
+        "ISSUE_DT", "MATURITY",
+        "SPREAD_AT_ISSUANCE_TO_WORST", "DUR_ADJ_MID", 
+        "DUR_MID", "ISSUE_PX", "YIELD_ON_ISSUE_DATE", "AMT_ISSUED",
+        "MUNI_ISSUE_SIZE", "IS_SUBORDINATED", 
+        "SALES_REV_TURN", "log_AMT_ISSUED", "log_MUNI_ISSUE_SIZE",
+        "SHORT_AND_LONG_TERM_DEBT", "MTY-YEARS", "State Code", "Region", "Y_l_day",
+        "Active_years", "years_to_maturity", "Log_DEBT", "Log_Sale_Turn", "S_L_DEBT",
+        "SALES_REV_TURN_int", "RTG_FITCH_LONG", "RTG_FITCH", "DM", "Med_m_S2"
+      )
+    )
+  )
+
+
+ARL_final_feat <- ARL_final_feat %>%
+  mutate(
+    # Extract numeric month from month column
+    month_num = case_when(
+      grepl("Jan", month, ignore.case = TRUE) ~ 1,
+      grepl("Feb", month, ignore.case = TRUE) ~ 2,
+      grepl("Mar", month, ignore.case = TRUE) ~ 3,
+      grepl("Apr", month, ignore.case = TRUE) ~ 4,
+      grepl("May", month, ignore.case = TRUE) ~ 5,
+      grepl("Jun", month, ignore.case = TRUE) ~ 6,
+      grepl("Jul", month, ignore.case = TRUE) ~ 7,
+      grepl("Aug", month, ignore.case = TRUE) ~ 8,
+      grepl("Sep", month, ignore.case = TRUE) ~ 9,
+      grepl("Oct", month, ignore.case = TRUE) ~ 10,
+      grepl("Nov", month, ignore.case = TRUE) ~ 11,
+      grepl("Dec", month, ignore.case = TRUE) ~ 12,
+      TRUE ~ as.numeric(month)
+    ),
+    year_month = paste(year, sprintf("%02d", month_num), sep = "_")
+  )
+
+# Get unique year-month combinations
+year_months <- unique(ARL_final_feat$year_month)
+year_months <- sort(year_months)
+
+# Function to process data for each year-month
+process_monthly_data <- function(data, yr_month) {
+  monthly_data <- data %>% 
+    filter(year_month == yr_month) %>% 
+    select(!c(year, month, year_month))
+  
+  # Remove missing values
+  monthly_data <- monthly_data[complete.cases(monthly_data),]
+  
+  # Convert all features to factors
+  monthly_data <- monthly_data %>% mutate_all(as.factor)
+  
+  return(monthly_data)
+}
+
+# Function to create transaction format and generate rules - REVISED
+generate_monthly_rules <- function(monthly_data, yr_month) {
+  # Create a copy to modify
+  trans_data <- monthly_data
+  
+  # Find the S column (it should contain S+ and S- values)
+  s_col <- NULL
+  for(col in names(trans_data)) {
+    if(any(trans_data[[col]] %in% c("S+", "S-"))) {
+      s_col <- col
+      break
+    }
+  }
+  
+  # Add feature names to each value EXCEPT the S column
+  for(col in names(trans_data)) {
+    if(col != s_col) {
+      trans_data[[col]] <- paste0(col, " : ", trans_data[[col]])
+    }
+    # S column remains as S+ or S- without modification
+  }
+  
+  # Unite all columns
+  monthly_tr <- trans_data %>%
+    unite(item, everything(), sep = ",")
+  
+  # Write temporary CSV
+  temp_file <- paste0("temp_", yr_month, ".csv")
+  write.csv(monthly_tr, temp_file, quote = FALSE, row.names = FALSE)
+  
+  # Read as transactions
+  tr_monthly <- read.transactions(temp_file, format = "basket", sep = ",")
+  
+  # Initialize empty rules
+  PP_rules <- NULL
+  NP_rules <- NULL
+  P_S1_rules <- NULL
+  N_S1_rules <- NULL
+  
+  # Try to generate positive rules (S+)
+  tryCatch({
+    PP_rules <- apriori(tr_monthly, 
+                        parameter = list(supp = 0.0001, conf = 0.0001, maxlen = 2),
+                        appearance = list(default = "lhs", rhs = "S+"))
+    
+    # Filter S1 rules (size == 2)
+    if(length(PP_rules) > 0) {
+      P_S1_rules <- PP_rules[quality(PP_rules)$confidence > 0.0001 & 
+                             quality(PP_rules)$support > 0.0001 & 
+                             size(PP_rules) == 2]
+    }
+  }, error = function(e) {
+    cat("Warning: Could not generate positive rules for", yr_month, "\n")
+    cat("Error:", e$message, "\n")
+  })
+  
+  # Try to generate negative rules (S-)
+  tryCatch({
+    NP_rules <- apriori(tr_monthly, 
+                        parameter = list(supp = 0.0001, conf = 0.0001, maxlen = 2),
+                        appearance = list(default = "lhs", rhs = "S-"))
+    
+    # Filter S1 rules (size == 2)
+    if(length(NP_rules) > 0) {
+      N_S1_rules <- NP_rules[quality(NP_rules)$confidence > 0.0001 & 
+                             quality(NP_rules)$support > 0.0001 & 
+                             size(NP_rules) == 2]
+    }
+  }, error = function(e) {
+    cat("Warning: Could not generate negative rules for", yr_month, "\n")
+    cat("Error:", e$message, "\n")
+  })
+  
+  # Clean up temporary file
+  file.remove(temp_file)
+  
+  return(list(positive = P_S1_rules, negative = N_S1_rules))
+}
+
+# Process all months and generate rules - REVISED
+all_positive_rules <- list()
+all_negative_rules <- list()
+
+for(i in 1:length(year_months)) {
+  cat("Processing", year_months[i], "\n")
+  
+  # Process monthly data
+  monthly_data <- process_monthly_data(ARL_final_feat, year_months[i])
+  
+  # Skip if no data for this month
+  if(nrow(monthly_data) == 0) {
+    cat("  No data for", year_months[i], "- skipping\n")
+    next
+  }
+  
+  # Generate rules
+  monthly_rules <- generate_monthly_rules(monthly_data, year_months[i])
+  
+  # Convert positive rules to dataframe and add time identifiers
+  if(!is.null(monthly_rules$positive) && length(monthly_rules$positive) > 0) {
+    pos_df <- as(monthly_rules$positive, "data.frame")
+    pos_df$year_month <- year_months[i]
+    pos_df$year <- as.numeric(substr(year_months[i], 1, 4))
+    pos_df$month <- as.numeric(substr(year_months[i], 6, 7))
+    # Properly extract rule by removing " => {S+}" from the end
+    pos_df$rules <- gsub(" => \\{S\\+\\}$", "", pos_df$rules)
+    all_positive_rules[[i]] <- pos_df
+    cat("  Generated", nrow(pos_df), "positive rules\n")
+  } else {
+    cat("  No positive rules generated\n")
+  }
+  
+  # Convert negative rules to dataframe and add time identifiers
+  if(!is.null(monthly_rules$negative) && length(monthly_rules$negative) > 0) {
+    neg_df <- as(monthly_rules$negative, "data.frame")
+    neg_df$year_month <- year_months[i]
+    neg_df$year <- as.numeric(substr(year_months[i], 1, 4))
+    neg_df$month <- as.numeric(substr(year_months[i], 6, 7))
+    # Properly extract rule by removing " => {S-}" from the end
+    neg_df$rules <- gsub(" => \\{S-\\}$", "", neg_df$rules)
+    all_negative_rules[[i]] <- neg_df
+    cat("  Generated", nrow(neg_df), "negative rules\n")
+  } else {
+    cat("  No negative rules generated\n")
+  }
+}
+
+# Combine all results - REVISED
+# Remove NULL entries before combining
+all_positive_rules <- all_positive_rules[!sapply(all_positive_rules, is.null)]
+all_negative_rules <- all_negative_rules[!sapply(all_negative_rules, is.null)]
+
+# Combine only if we have data
+if(length(all_positive_rules) > 0) {
+  Consistency_df_P_S1_monthly <- do.call(rbind, all_positive_rules)
+  # Create date column for plotting
+  Consistency_df_P_S1_monthly <- Consistency_df_P_S1_monthly %>%
+    mutate(date = as.Date(paste(year, month, "01", sep = "-")))
+  cat("\nTotal positive rules across all months:", nrow(Consistency_df_P_S1_monthly), "\n")
+} else {
+  cat("\nWarning: No positive rules generated for any month\n")
+  Consistency_df_P_S1_monthly <- data.frame()
+}
+
+if(length(all_negative_rules) > 0) {
+  Consistency_df_N_S1_monthly <- do.call(rbind, all_negative_rules)
+  # Create date column for plotting
+  Consistency_df_N_S1_monthly <- Consistency_df_N_S1_monthly %>%
+    mutate(date = as.Date(paste(year, month, "01", sep = "-")))
+  cat("Total negative rules across all months:", nrow(Consistency_df_N_S1_monthly), "\n")
+} else {
+  cat("\nWarning: No negative rules generated for any month\n")
+  Consistency_df_N_S1_monthly <- data.frame()
+}
+
+
+
+```
+
+
+Fig 3
+```{r}
+# Define the color schemes based on ACTUAL rule labels from your data
+positive_rule_colors_new <- c(
+  "{MUNI_TAX_PROV : FED TAXABLE/ST TAX-EXEMPT}" = "#FF0000",   # Red
+  "{Iss_pri._spread : At Par}"                  = "#0000FF",   # Blue
+  "{S_AT_Iss : Higher than 100}"                = "#00688B",   # SteelBlue
+  "{years_to_maturity_int : Higher than 14.4}"  = "#800020",   # Burgundy
+  "{Y_OID : Higher than 3.2}"                   = "#FF4500",   # OrangeRed
+  "{MTY_YEARS_int : Higher than 17}"            = "#800080",   # Purple
+  "{S_AT_Iss : 57_100}"                         = "#00BFFF",   # DeepSkyBlue
+  "{MTY_YEARS_int : 12.3_17}"                   = "#2F4F4F",   # DarkSlateGray
+  "{DAM : Higher than 7}"                       = "#A52A2A",   # Brown
+  "{Y_OID : 2.4_3.2}"                           = "#556B2F" ,  # DarkOliveGreen
+   "{CALLABLE : Callable}"                       = "#8B4513",   # SaddleBrown
+   "{years_to_maturity_int : 9.4_14.4}"          = "#483D8B",   # DarkSlateBlue
+   "{Active_years_int :  Less than 1.1}"         = "#2E8B57",   # SeaGreen
+   "{SELF_REPRTD_GREEN_INSTR_INDCTR : YES}"      = "#8FBC8F",   # DarkSeaGreen
+   "{Amt_iss_int : Higher than 16}"              = "#D2691E"    # Chocolate
+)
+
+negative_rule_colors_new <- c(
+  "{S_AT_Iss : Less than 17}"                   = "#8B0000",   # DarkRed
+  "{Y_OID :  Less than 1.7}"                    = "#000080",   # Navy
+  "{MTY_YEARS_int :  Less than 8}"              = "#8B008B",   # DarkMagenta
+  "{years_to_maturity_int :  Less than 4.7}"    = "#FF8C00",   # DarkOrange
+  "{CALLABLE : Non-callable}"                   = "#000000",   # Black
+  "{Iss_pri._spread : At Premium}"              = "#4B0082",   # Indigo
+  "{years_to_maturity_int : 4.7_9.4}"           = "#B8860B",   # DarkGoldenrod
+  "{MUNI_TAX_PROV : FED & ST TAX-EXEMPT}"       = "#008B8B",   # DarkCyan
+  "{MTY_YEARS_int : 8_12.3}"                    = "#DC143C",   # Crimson
+  "{CPN_Group : 5_8.5(%)}"                      = "#228B22",   # ForestGreen
+   "{S_AT_Iss : 17_57}"                          = "#006400",   # DarkGreen
+   "{DAM :  Less than 2.8}"                      = "#191970",   # MidnightBlue
+   "{DAM : 2.8_4.8}"                             = "#808000",   # Olive
+   "{Amt_iss_int : Less than 14}"                = "#708090",   # SlateGray
+   "{MUNI_ISSUE_SIZE_int : 17_18.7}"             = "#CD5C5C"    # IndianRed
+)
+
+# Plot positive rules - CONFIDENCE (no legend)
+p1 <- Consistency_df_P_S1_monthly %>%
+  filter(rules %in% names(positive_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = confidence, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = positive_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), labels = seq(0, 1, 0.2), limits = c(0, 1)) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Confidence",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 14, margin = margin(r = 10)),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 10, b = 15, l = 15))
+
+print(p1)
+
+# Plot positive rules - SUPPORT (no legend)
+p1_support <- Consistency_df_P_S1_monthly %>%
+  filter(rules %in% names(positive_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = support, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = positive_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), labels = seq(0, 1, 0.2), limits = c(0, 1)) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Support",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 14, margin = margin(r = 10)),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 10, b = 15, l = 15))
+
+print(p1_support)
+
+# Plot positive rules - LIFT (with legend)
+p1_lift <- Consistency_df_P_S1_monthly %>%
+  filter(rules %in% names(positive_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = lift, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = positive_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  ylim(0,13) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Lift",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 16, margin = margin(r = 10)),
+        legend.position = "bottom",
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        legend.key.width = unit(0.6, "cm"),
+        legend.key.height = unit(0.25, "cm"),
+        legend.box.margin = margin(t = 2),
+        legend.margin = margin(t = 0, b = 0),
+        plot.margin = margin(t = 5, r = 5, b = 25, l = 10)) +
+  guides(color = guide_legend(ncol = 4, byrow = TRUE))
+
+print(p1_lift)
+
+# Plot negative rules - CONFIDENCE (no legend)
+p2 <- Consistency_df_N_S1_monthly %>%
+  filter(rules %in% names(negative_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = confidence, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = negative_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), labels = seq(0, 1, 0.2), limits = c(0, 1)) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Confidence",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 16, margin = margin(r = 10)),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 10, b = 15, l = 15))
+
+print(p2)
+
+# Plot negative rules - SUPPORT (no legend)
+p2_support <- Consistency_df_N_S1_monthly %>%
+  filter(rules %in% names(negative_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = support, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = negative_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), labels = seq(0, 1, 0.2), limits = c(0, 1)) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Support",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 16, margin = margin(r = 10)),
+        legend.position = "none",
+        plot.margin = margin(t = 10, r = 10, b = 15, l = 15))
+
+print(p2_support)
+
+# Plot negative rules - LIFT (with legend)
+p2_lift <- Consistency_df_N_S1_monthly %>%
+  filter(rules %in% names(negative_rule_colors_new)) %>%
+  ggplot(aes(x = date, y = lift, color = rules)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = negative_rule_colors_new) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  ylim(0,13) +
+  theme_minimal() +
+  labs(title = "",
+       x = "Date", 
+       y = "Lift",
+       color = "Rules") +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.text.y = element_text(size = 13),
+        axis.title.y = element_text(size = 16, margin = margin(r = 10)),
+        legend.position = "bottom",
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10),
+        legend.key.width = unit(0.6, "cm"),
+        legend.key.height = unit(0.25, "cm"),
+        legend.box.margin = margin(t = 2),
+        legend.margin = margin(t = 0, b = 0),
+        plot.margin = margin(t = 5, r = 5, b = 25, l = 10)) +
+  guides(color = guide_legend(ncol = 4, byrow = TRUE))
+
+print(p2_lift)
+
+
+```
+
+```{r}
+
+# Save all plots to the specified directory
+save_path <- "..."
+
+ggsave(filename = paste0(save_path, "positive_spread_confidence.png"), plot = p1, width = 12, height = 8, dpi = 300)
+ggsave(filename = paste0(save_path, "positive_spread_support.png"), plot = p1_support, width = 12, height = 8, dpi = 300)
+ggsave(filename = paste0(save_path, "positive_spread_lift.png"), plot = p1_lift, width = 12, height = 8, dpi = 300)
+ggsave(filename = paste0(save_path, "negative_spread_confidence.png"), plot = p2, width = 12, height = 8, dpi = 300)
+ggsave(filename = paste0(save_path, "negative_spread_support.png"), plot = p2_support, width = 12, height = 8, dpi = 300)
+ggsave(filename = paste0(save_path, "negative_spread_lift.png"), plot = p2_lift, width = 12, height = 8, dpi = 300)
+
+
+```
+
+

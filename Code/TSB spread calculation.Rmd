@@ -1,0 +1,444 @@
+
+---
+title: "Approach 2 for Spread Calculation - Parallel Version"
+author: "Hadi"
+output: html_document
+---
+
+# Load libraries
+```{r}
+library(splines2)
+library(splines)
+library(mgcv)
+library(RQuantLib)
+library(tidyr)
+library(xts)
+library(plotly)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(tidyverse)
+library(zoo)
+library(writexl)
+library(YieldCurve)
+library(patchwork)
+library(gridExtra)
+library(stargazer)
+library(scales)
+library(pdfetch)
+library(feather)
+library(foreach)
+library(doParallel)
+library(parallel)
+library(xtable)
+```
+
+# Load Data
+```{r}
+#Load bonds yield and feature data
+California <- "..."
+California <- "..."
+California$PAR_AMT <- as.numeric(100)
+
+# Load Treasury data
+par_data <- "..."
+```
+
+# Prepare Treasury Data
+```{r}
+names(par_data)[-1] <- c("0.083", "0.167", "0.231", "0.333", "0.500", "1", "2", "3",
+"5", "7", "10", "20", "30")
+
+par_data$Date <- mdy(par_data$Date)
+
+par_data_mat <- as.matrix(par_data)
+par_data_mat <- par_data_mat[, -1]
+
+
+par_tby <- as.xts(par_data_mat, order.by = par_data$Date)
+
+par_tby <- na.approx(par_tby, na.rm = FALSE)
+```
+
+# Data Preparation and Partitioning
+```{r}
+# Grouping Criteria
+Cal_callable <- California %>% filter(CALLABLE == "TRUE", CPN != 15, CPN_FREQ != 12)
+Cal_non_callable <- California %>% filter(CALLABLE == "FALSE", CPN != 15, CPN_FREQ != 12)
+
+# Coupon intervals
+interval_non_call <- cut(Cal_non_callable$CPN, breaks = c(0, 2.99, 4.999, 7.69), 
+                        labels = c("CPN_0_3", "CPN_3_5", "CPN_5_8"))
+Cal_non_callable <- Cal_non_callable %>% mutate(CPN_Group = interval_non_call)
+
+interval_call <- cut(Cal_callable$CPN, breaks = c(0, 3.5, 4.999, 8.5), 
+                    labels = c("CPN_0_3.5", "CPN_3.5_5", "CPN_5_8.5"))
+Cal_callable <- Cal_callable %>% mutate(CPN_Group = interval_call)
+
+# Tax provinces to EXCLUDE in the "op" groups
+excluded_tax <- c(
+  "FED TAXABLE/ST TAX-EXEMPT",
+  "FED TAXABLE",
+  "FED TAXABLE/ST TAXABLE"
+)
+
+# Create partitions
+G1_nc_all <- Cal_non_callable %>%
+  filter(CPN_Group == "CPN_0_3", Date >= as.Date("2020-01-01"))
+
+G2_nc_op <- Cal_non_callable %>%
+  filter(CPN_Group == "CPN_3_5", Date >= as.Date("2020-01-01"),
+         !is.na(MUNI_TAX_PROV), !(MUNI_TAX_PROV %in% excluded_tax))
+
+G2_nc_ft <- Cal_non_callable %>%
+  filter(CPN_Group == "CPN_3_5", Date >= as.Date("2020-01-01"),
+         MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT")
+
+G3_nc_all <- Cal_non_callable %>%
+  filter(CPN_Group == "CPN_5_8", Date >= as.Date("2020-01-01"))
+
+G1_c_op <- Cal_callable %>%
+  filter(CPN_Group == "CPN_0_3.5", Date >= as.Date("2020-01-01"),
+         !is.na(MUNI_TAX_PROV), !(MUNI_TAX_PROV %in% excluded_tax))
+
+G1_c_ft <- Cal_callable %>%
+  filter(CPN_Group == "CPN_0_3.5", Date >= as.Date("2020-01-01"),
+         MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT")
+
+G2_c_op <- Cal_callable %>%
+  filter(CPN_Group == "CPN_3.5_5", Date >= as.Date("2020-01-01"),
+         !is.na(MUNI_TAX_PROV), !(MUNI_TAX_PROV %in% excluded_tax))
+
+G2_c_ft <- Cal_callable %>%
+  filter(CPN_Group == "CPN_3.5_5", Date >= as.Date("2020-01-01"),
+         MUNI_TAX_PROV == "FED TAXABLE/ST TAX-EXEMPT")
+
+G3_c_all <- Cal_callable %>%
+  filter(CPN_Group == "CPN_5_8.5", Date >= as.Date("2020-01-01"),
+         !is.na(MUNI_TAX_PROV), !(MUNI_TAX_PROV %in% excluded_tax))
+```
+
+# Function Definitions
+```{r}
+# Bond price calculator function
+bp_calculator_a2 <- function(x, y, m, cuts, bond_type, year_fraction, coupon_rate, 
+                          coupon_frequency, face_value) {
+  
+  bond_price <- 0
+  fitted_curve <- suppressWarnings(lm(y ~ bs(x, degree = m, knots = cuts)))
+  
+  if (bond_type %in% c("FIXED", "FIXED, OID")) {
+    C <- face_value * coupon_rate / coupon_frequency
+    n <- year_fraction * coupon_frequency
+    tau_n <- c(seq(ifelse(n %% 1 == 0.00, 1, n %% 1), n, by = 1) / coupon_frequency)
+    
+    for (t in tau_n) {
+      discounted_cashflow <- 
+        C / ((1 + predict(fitted_curve, newdata = data.frame(x = t))/(100*coupon_frequency)) ^ which(tau_n == t))
+      bond_price <- bond_price + discounted_cashflow 
+    }
+    
+    final_cashflow <- 
+      (face_value) / ((1 + predict(fitted_curve, newdata = data.frame(x = year_fraction))/(100*coupon_frequency)) ^ which(tau_n == year_fraction))
+    bond_price <- bond_price + final_cashflow  
+  } else if (bond_type == "ZERO COUPON") {
+    bond_price <- 
+      (face_value) / ((1 + predict(fitted_curve, newdata = data.frame(x = year_fraction))/(100*coupon_frequency)) ^ which(tau_n == year_fraction))
+  } else {
+    stop("Unsupported bond type")
+  }
+  
+  return(bond_price)
+}
+
+# ZCB YTM equation
+zcb_eq_YTM_2 <- function(zcb_ytm, year_fraction, face_value, bond_type, bond_price, 
+                          coupon, coupon_frequency) {
+  C <- face_value * coupon / coupon_frequency
+  n <- year_fraction * coupon_frequency
+  tau_n <- c(seq(ifelse(n %% 1 == 0.00, 1, n %% 1), n, by = 1) / coupon_frequency)
+  if (bond_type %in% c("FIXED", "FIXED, OID", "ZERO COUPON, OID")) {
+    return(((1 + zcb_ytm) ^ which(tau_n == year_fraction)) - ((face_value + C) / bond_price))
+  } else {
+    stop("Unsupported bond_type")
+  }
+}
+
+# Function to calculate Green PV for a partition
+calculate_green_pv <- function(data, pv_column_name = "GPV_2") {
+  data[[pv_column_name]] <- NA
+  
+  for (i in 1:nrow(data)) {
+    x <- data$YF[data$Date == data$Date[i]]
+    y <- data$yield[data$Date == data$Date[i]]
+    m <- 1
+    cuts <- summary(sort(x))[c(2,3,5)]
+    bond_type <- data$CPN_TYP[i]
+    year_fraction <- as.numeric(data$YF[i])
+    coupon_rate <- as.numeric(data$CPN[i]) / 100
+    coupon_frequency <- as.numeric(data$CPN_FREQ[i])
+    face_value <- as.numeric(data$PAR_AMT[i])
+
+    gbp <- bp_calculator_a2(x, y, m, cuts, bond_type, year_fraction, coupon_rate,
+                            coupon_frequency, face_value)
+
+    data[[pv_column_name]][i] <- gbp
+  }
+  return(data)
+}
+
+# Function to calculate Green ZCB YTM for a partition
+calculate_green_zcb_ytm <- function(data, pv_column, ytm_column_name = "GZCB_YTM_2") {
+  data[[ytm_column_name]] <- NA
+  
+  for (i in 1:nrow(data)) {
+    year_fraction <- as.numeric(data$YF[i])
+    face_value <- as.numeric(data$PAR_AMT[i])
+    bond_price <- data[[pv_column]][i]
+    coupon <- as.numeric(data$CPN[i])/100
+    bond_type <- data$CPN_TYP[i]
+    coupon_frequency <- as.numeric(data$CPN_FREQ[i])
+
+    result <- uniroot(zcb_eq_YTM_2, year_fraction = year_fraction, coupon = coupon, 
+                      bond_type = bond_type, face_value = face_value, 
+                      coupon_frequency = coupon_frequency, bond_price = bond_price, 
+                      interval = c(-1, 20))
+
+    data[[ytm_column_name]][i] <- round(result$root * 100, digits = 4)
+  }
+  return(data)
+}
+
+# Function to calculate Treasury PV for a partition
+calculate_treasury_pv <- function(data, par_tby, pv_column_name = "RPV_2") {
+  data[[pv_column_name]] <- NA
+  
+  for (i in 1:nrow(data)) {
+    target_date <- as.Date(data$Date[i])
+    
+    if (target_date %in% index(par_tby)) {
+      x <- as.numeric(sort(names(par_tby)))
+      y <- as.numeric(par_tby[target_date, sort(names(par_tby))])
+    } else {
+      nearest_date <- index(par_tby)[which.min(abs(index(par_tby) - target_date))]
+      x <- as.numeric(sort(names(par_tby)))
+      y <- as.numeric(par_tby[nearest_date, sort(names(par_tby))])
+    }
+    
+    if (any(is.na(y))) next
+    
+    m <- 3
+    cuts <- summary(x)[c(2,3,5)]
+    bond_type <- data$CPN_TYP[i]
+    year_fraction <- as.numeric(data$YF[i])
+    coupon_rate <- as.numeric(data$CPN[i]) / 100
+    coupon_frequency <- as.numeric(data$CPN_FREQ[i])
+    face_value <- as.numeric(data$PAR_AMT[i])
+
+    tr_p_2 <- bp_calculator_a2(x, y, m, cuts, bond_type, year_fraction, coupon_rate,
+                         coupon_frequency, face_value)
+
+    data[[pv_column_name]][i] <- tr_p_2
+  }
+  return(data)
+}
+
+# Function to calculate Reference ZCB YTM for a partition
+calculate_reference_zcb_ytm <- function(data, pv_column, ytm_column_name = "RZCB_YTM_2") {
+  data[[ytm_column_name]] <- NA
+  
+  for (i in 1:nrow(data)) {
+    year_fraction <- as.numeric(data$YF[i])
+    face_value <- as.numeric(data$PAR_AMT[i])
+    bond_price <- data[[pv_column]][i]
+    coupon_frequency <- as.numeric(data$CPN_FREQ[i])
+    coupon <- as.numeric(data$CPN[i])/100
+    bond_type <- data$CPN_TYP[i]
+
+    result <- uniroot(zcb_eq_YTM_2, year_fraction = year_fraction, coupon = coupon,
+                      face_value = face_value, bond_price = bond_price,
+                      coupon_frequency = coupon_frequency, bond_type = bond_type,
+                      interval = c(-1, 20))
+
+    data[[ytm_column_name]][i] <- round(result$root * 100, digits = 4)
+  }
+  return(data)
+}
+
+# Function to calculate spreads
+calculate_spreads <- function(data, green_ytm_col, ref_ytm_col) {
+  data$S2 <- round(data[[green_ytm_col]] - data[[ref_ytm_col]], 2)
+  return(data)
+}
+```
+
+# Setup Parallel Processing
+```{r}
+# Detect number of cores and set up cluster
+n_cores <- detectCores() - 1
+cat("Setting up parallel processing with", n_cores, "cores\n")
+
+# Create cluster
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Export necessary data and functions to all workers
+clusterExport(cl, c(
+  "bp_calculator_a2", 
+  "zcb_eq_YTM_2", 
+  "calculate_green_pv", 
+  "calculate_green_zcb_ytm",
+  "calculate_treasury_pv", 
+  "calculate_reference_zcb_ytm", 
+  "calculate_spreads",
+  "par_tby"
+))
+
+# Load required libraries on each worker
+clusterEvalQ(cl, {
+  library(splines)
+  library(dplyr)
+  suppressWarnings(library(splines2))
+})
+```
+
+# Parallel Main Calculation Loop
+```{r}
+# Create list of all partitions with their calculation requirements
+partitions <- list(
+  list(data = G1_nc_all, name = "G1_nc_all", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G2_nc_op, name = "G2_nc_op", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G2_nc_ft, name = "G2_nc_ft", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G3_nc_all, name = "G3_nc_all", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G1_c_op, name = "G1_c_op", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G1_c_ft, name = "G1_c_ft", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G2_c_op, name = "G2_c_op", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G2_c_ft, name = "G2_c_ft", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE),
+  list(data = G3_c_all, name = "G3_c_all", calc_green_pv = TRUE, calc_green_ytm = TRUE, calc_treasury = TRUE, calc_spreads = TRUE)
+)
+
+# Function to process a single partition
+process_partition <- function(partition) {
+  # Suppress warnings for this worker
+  options(warn = -1)
+  
+  cat("Processing", partition$name, "on worker\n")
+  
+  # Calculate Green PV if required
+  if (partition$calc_green_pv) {
+    partition$data <- calculate_green_pv(partition$data, "GPV_2")
+  }
+  
+  # Calculate Green ZCB YTM if required
+  if (partition$calc_green_ytm) {
+    partition$data <- calculate_green_zcb_ytm(partition$data, "GPV_2")
+  }
+  
+  # Calculate Treasury PV if required
+  if (partition$calc_treasury) {
+    partition$data <- calculate_treasury_pv(partition$data, par_tby)
+  }
+  
+  # Calculate Reference ZCB YTM if required
+  if (partition$calc_treasury) {
+    partition$data <- calculate_reference_zcb_ytm(partition$data, "RPV_2")
+  }
+  
+  # Calculate spreads if required
+  if (isTRUE(partition$calc_spreads)) {
+    partition$data <- calculate_spreads(partition$data, "GZCB_YTM_2", "RZCB_YTM_2")
+  }
+  
+  return(partition)
+}
+
+# Run calculations in parallel
+cat("Starting parallel calculations...\n")
+start_time <- Sys.time()
+
+results <- foreach(
+  partition = partitions,
+  .packages = c("dplyr", "splines")
+) %dopar% {
+  process_partition(partition)
+}
+
+end_time <- Sys.time()
+cat("Parallel calculations completed in", round(difftime(end_time, start_time, units = "mins"), 2), "minutes\n")
+
+# Assign results back to global variables
+for (i in seq_along(results)) {
+  assign(results[[i]]$name, results[[i]]$data, envir = .GlobalEnv)
+}
+
+cat("All calculations completed and variables assigned!\n")
+```
+
+# Clean up parallel processing
+```{r}
+# Stop the cluster to free up resources
+stopCluster(cl)
+cat("Parallel cluster stopped\n")
+```
+
+# Combine and Save Results
+```{r}
+# Create output directory if it doesn't exist
+output_dir <- path.expand("~/...")
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat("Created output directory:", output_dir, "\n")
+}
+
+# Combine all partitions
+California_S2 <- rbind(G1_nc_all, G2_nc_op, G2_nc_ft, G3_nc_all, G1_c_op, G1_c_ft, 
+                       G2_c_op, G2_c_ft, G3_c_all)
+
+# Save as RDS
+# output_file <- file.path(output_dir, "...")
+# saveRDS(California_S2, output_file)
+# 
+# cat("Combined dataset saved to:", output_file, "\n")
+# cat("Dataset contains", nrow(California_S2), "rows and", ncol(California_S2), "columns\n")
+```
+
+# Generate Summary Table (Table 1)
+```{r}
+# Function to create summary for a partition
+create_summary <- function(data, group_num, callability) {
+  data %>% summarise(
+    Group = group_num,
+    Callability = callability,
+    Coupon = paste(min(CPN, na.rm = TRUE), max(CPN, na.rm = TRUE), sep = "-"),
+    Mean = round(mean(yield, na.rm = TRUE), 3),
+    Median = round(median(yield, na.rm = TRUE), 3),
+    SD = round(sd(yield, na.rm = TRUE), 3),
+    N = n()
+  )
+}
+
+# Create summaries for all groups
+Groups <- rbind(
+  create_summary(G1_nc_all, "1", "Non Callable"),
+  create_summary(G2_nc_op, "2", "Non Callable"),
+  create_summary(G2_nc_ft, "3", "Non Callable"),
+  create_summary(G3_nc_all, "4", "Non Callable"),
+  create_summary(G1_c_op, "5", "Callable"),
+  create_summary(G1_c_ft, "6", "Callable"),
+  create_summary(G2_c_op, "7", "Callable"),
+  create_summary(G2_c_ft, "8", "Callable"),
+  create_summary(G3_c_all, "9", "Callable")
+)
+
+# Display summary table
+print("Summary Table:")
+print(Groups)
+
+# Export summary table
+cat("\nLaTeX Summary Table:\n")
+print(xtable(Groups), type = "latex")
+```
+
+

@@ -1,0 +1,242 @@
+---
+title: "Anova Test"
+author: "Hadi"
+output: html_document
+---
+
+load libraries
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(tidyverse)
+library(stringr)
+library(reshape2)
+library(fds)
+library(tidyr)
+library(transport)
+library(viridis)
+library(gridExtra)
+library(kableExtra)
+library(lmtest)
+library(tseries)
+library(feather)
+library(grid)
+```
+
+Load and prepare the dataset
+```{r}
+
+California <- readRDS("...")
+
+
+# Rename maturity column
+colnames(California)[65] <- "Maturity_OID"
+colnames(California)[56] <- "Pricing_TYP"
+colnames(California)[44] <- "CPN_range"
+colnames(California)[58] <- "Issued_Amt"
+colnames(California)[55] <- "Y_OID"
+colnames(California)[53] <- "DAM"
+colnames(California)[52] <- "S_OID"
+
+
+California <- California %>% dplyr::select(ID_CUSIP, Date, S2, Maturity_OID, MUNI_TAX_PROV,
+                                    Y_OID, S_OID, DAM, CALLABLE, Issued_Amt,
+                                    CPN_range, Pricing_TYP)
+
+
+```
+
+
+
+ANOVA TEST 
+```{r}
+
+attributes <- c("MUNI_TAX_PROV","Pricing_TYP", "CPN_range",
+                "S_OID","Y_OID", "DAM", "CALLABLE", "Issued_Amt")
+ds <- list()
+ds_maturity <- California %>%
+    filter(Date > as.Date("2016-12-31")) %>%
+    group_by(Date, Maturity_OID) %>%
+    summarise(S2_med = median(S2), .groups = 'drop') %>%
+    ungroup()
+
+for (i in 1:length(attributes)) {
+  ds[[i]] <- California %>%
+    filter(Date > as.Date("2016-12-31")) %>%
+    group_by(Date, Maturity_OID, !!sym(attributes[i])) %>%
+    summarise(S2_med = median(S2), .groups = 'drop') %>%
+    ungroup()
+}
+# Combine all data frames into one
+ds <- bind_rows(ds)
+
+
+
+
+#=============================ANOVA====================================
+
+
+
+maturities <- c(" Less than 8", "8_12.3", "12.3_17", "Higher than 17")
+attributes <- c("MUNI_TAX_PROV","Pricing_TYP", "CPN_range",
+                "S_OID","Y_OID", "DAM", "CALLABLE", "Issued_Amt")
+aov_t_data <- list()
+anov_test_1 <- list()
+
+#Group data according to maturity and attributes
+for (i in 1:length(maturities)) {
+  aov_t_data[[i]] <- vector("list", length(attributes))
+  anov_test_1[[i]] <- vector("list", length(attributes))
+  
+  for (j in 1:length(attributes)) {
+    aov_t_data[[i]][[j]] <- California %>%
+      filter(Date > as.Date("2019-12-31")) %>%
+      group_by(Date, Maturity_OID, !!sym(attributes[j])) %>%
+      filter(Maturity_OID == maturities[i]) %>%
+      summarise(S2_med = median(S2), .groups = 'drop') %>%
+      ungroup()
+    
+    #Anova test for S_1
+    aov_t_data[[i]][[j]][[attributes[j]]] <- as.factor(aov_t_data[[i]][[j]][[attributes[j]]])
+    formula_str_1 <- paste("S2_med ~", attributes[j])
+    formula_1 <- as.formula(formula_str_1)
+    anov_test_1[[i]][[j]] <- anova(aov(formula_1, data = aov_t_data[[i]][[j]]))
+  }
+}
+
+
+
+
+```
+
+
+ANOVA and Boxplot (Fig F.3)
+```{r}
+
+
+options(warn = -1)
+
+attributes <- c("MUNI_TAX_PROV","Pricing_TYP", "CPN_range",
+                "S_OID","Y_OID", "DAM", "CALLABLE", "Issued_Amt")
+
+maturities <- c(" Less than 8", 
+                "8_12.3", 
+                "12.3_17", 
+                "Higher than 17")
+
+# Prepare data for all combinations
+aov_t_data <- list()
+for (i in 1:length(maturities)) {
+  aov_t_data[[i]] <- vector("list", length(attributes))
+  for (j in 1:length(attributes)) {
+    aov_t_data[[i]][[j]] <- California %>%
+      group_by(Date, Maturity_OID, !!sym(attributes[j])) %>%
+      filter(Maturity_OID == maturities[i]) %>%
+      summarise(S2_med = median(S2), .groups = 'drop') %>%
+      ungroup()
+  }
+}
+
+# Convert to dataframe
+aov_t_data_df <- bind_rows(aov_t_data)
+
+# Create all plots in a grid
+plot_list <- list()
+plot_counter <- 1
+
+for (i in 1:length(attributes)) {  # Rows (attributes)
+  for (j in 1:length(maturities)) {  # Columns (maturities)
+    
+    plot_data <- aov_t_data_df %>%
+      dplyr::select(Date, Maturity_OID, S2_med, !!sym(attributes[i])) %>%
+      filter(Maturity_OID == maturities[j]) %>%
+      # Remove NA values from the attribute column first
+      filter(!is.na(!!sym(attributes[i])) & !!sym(attributes[i]) != "NA") %>%
+      # Then apply specific filtering for MUNI_TAX_PROV
+      filter(if (attributes[i] == "MUNI_TAX_PROV") {
+               (!!sym(attributes[i]) %in% c("FED TAXABLE/ST TAX-EXEMPT", "FED & ST TAX-EXEMPT"))
+             } else {
+               TRUE
+             }) %>%
+      # Final check to remove any remaining NAs
+      drop_na(!!sym(attributes[i]))
+    
+    # Shorten tax labels
+    if (attributes[i] == "MUNI_TAX_PROV") {
+      plot_data <- plot_data %>%
+        mutate(!!sym(attributes[i]) := case_when(
+          !!sym(attributes[i]) == "FED TAXABLE/ST TAX-EXEMPT" ~ "Fed Taxable",
+          !!sym(attributes[i]) == "FED & ST TAX-EXEMPT" ~ "Fed&State Exempt",
+          TRUE ~ as.character(!!sym(attributes[i]))
+        ))
+    }
+    
+    if (nrow(plot_data) > 0) {
+      p <- ggplot(plot_data, aes(x = !!sym(attributes[i]), y = S2_med, fill = !!sym(attributes[i]))) +
+        geom_boxplot(alpha = 0.5, color = "black") +
+        geom_point(shape = 21, size = 1.5, 
+                   position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.75)) +
+        geom_hline(yintercept = median(California$S2[California$Maturity_OID == maturities[j]], na.rm = TRUE), 
+                   linetype = "dashed", color = "red", size = 0.8) + 
+        geom_hline(yintercept = 0, linetype = "solid", color = "black", size = 0.3) +
+        ylim(-2, 2) +
+        labs(x = "",  # Remove x-label from all plots
+             y = if(j == 1) "S2_med" else "",  # Only show y-label on first column
+             title = if(i == 1) paste0("Maturity_OID: ", maturities[j]) else "") +  # Only show title on top row with prefix
+        theme_minimal() +
+        theme(
+          panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+          axis.text.x = element_text(angle = 25, hjust = 1, size = 6), # Reduced angle and size
+          axis.text.y = element_text(size = 8),
+          axis.title = element_text(size = 9),
+          plot.title = element_text(size = 10, hjust = 0.5, face = "bold"), # Bold title
+          legend.position = "none",  # Remove individual legends
+          plot.margin = margin(1, 1, 1, 1, "mm") # Reduced margins for bigger plots
+        )
+      
+      # Add row labels (attribute names) on the left with bigger text
+      if (j == 1) {
+        p <- p + labs(y = paste0(attributes[i], "\n", "S2_med")) +
+          theme(axis.title.y = element_text(size = 12, face = "bold")) # Bold attribute names
+      }
+      
+    } else {
+      # Create empty plot if no data
+      p <- ggplot() + 
+        theme_void() + 
+        labs(title = if(i == 1) paste0("Maturity_OID: ", maturities[j]) else "")
+    }
+    
+    plot_list[[plot_counter]] <- p
+    plot_counter <- plot_counter + 1
+  }
+}
+
+# Create the combined plot without main title
+combined_plot <- grid.arrange(grobs = plot_list, 
+                             nrow = length(attributes), 
+                             ncol = length(maturities),
+                             left = textGrob("Attributes", rot = 90, vjust = 1,
+                                           gp = gpar(fontsize = 14, fontface = "bold")), # Bigger text
+                             bottom = textGrob("Maturity Groups", 
+                                             gp = gpar(fontsize = 12)))
+
+# Restore warnings
+options(warn = 0)
+
+# Display the plot
+print(combined_plot)
+
+# ============ SAVING SECTION ============
+# output_dir <- "..."
+# plot_filename <- paste(output_dir, "S2_boxplots_grid_all_attributes_maturities.png", sep = "/")
+# 
+# ggsave(plot_filename, plot = combined_plot, 
+#        width = 20, height = 24, units = "in", dpi = 300)
+# =========================================================================
+```
+
+
+
